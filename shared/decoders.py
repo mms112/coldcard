@@ -194,11 +194,6 @@ def decode_short_text(got):
             # was something else.
             pass
 
-    # multisig descriptor
-    # multi( catches both multi( and sortedmulti(
-    if ("multi(" in got):
-        return 'multi', (got,)
-
     if ("\n" in got) and ('pub' in got):
         # legacy multisig import/export format
         # [0-9a-fA-F]{8}\s*:\s*[xtyYzZuUvV]pub[1-9A-HJ-NP-Za-km-z]{107}
@@ -213,6 +208,10 @@ def decode_short_text(got):
                 c += 1
             if c > 1:
                 return 'multi', (got,)
+
+    from descriptor import Descriptor
+    if Descriptor.is_descriptor(got):
+        return 'minisc', (got,)
 
     # Things with newlines in them are not URL's
     # - working URLs are not >4k
