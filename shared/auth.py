@@ -811,9 +811,12 @@ class ApproveTransaction(UserAuthorizedAction):
         try:
             dis.fullscreen('Wait...')
             gc.collect()           # visible delay caused by this but also sign_it() below
-            self.psbt.sign_it()
+            await self.psbt.sign_it()
         except FraudulentChangeOutput as exc:
             return await self.failure(exc.args[0], title='Change Fraud')
+        except FatalPSBTIssue as exc:
+            print('FatalPSBTIssue: ' + exc.args[0])
+            return await self.failure(exc.args[0])
         except MemoryError:
             msg = "Transaction is too complex"
             return await self.failure(msg)

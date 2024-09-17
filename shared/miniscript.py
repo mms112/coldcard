@@ -2,12 +2,12 @@
 #
 # Copyright (c) 2020 Stepan Snigirev MIT License embit/miniscript.py
 #
-import ngu, ujson, uio, chains, ure, version
+import ngu, ujson, uio, chains, ure, version, ustruct
 from ucollections import OrderedDict
 from binascii import unhexlify as a2b_hex
 from binascii import hexlify as b2a_hex
 from serializations import ser_compact_size, ser_string
-from desc_utils import Key, read_until, fill_policy, append_checksum
+from desc_utils import KeyDerivationInfo, Key, MusigKey, read_until, fill_policy, append_checksum, SECP256K1_ORDER, MUSIG_CHAINCODE
 from public_constants import MAX_TR_SIGNERS
 from wallet import BaseStorageWallet
 from menu import MenuSystem, MenuItem
@@ -41,7 +41,7 @@ class MiniScriptWallet(BaseStorageWallet):
 
     @property
     def policy(self):
-        if not self._policy:
+        if self._policy is None:
             self._policy = self.desc.storage_policy()
         return self._policy
 
@@ -127,6 +127,8 @@ class MiniScriptWallet(BaseStorageWallet):
         keys = [k.to_string() for k in self.desc.keys]
         if self.desc.tapscript or self.desc.miniscript:
             policy = self.desc.storage_policy()
+        elif self.desc.taproot:
+            policy = ""
 
         sh = self.desc.sh
         wsh = self.desc.wsh
@@ -156,40 +158,71 @@ class MiniScriptWallet(BaseStorageWallet):
             res = []
             if self._key:
                 ik = Key.from_string(self.key)
-                if ik.origin:
-                    res.append(ik.origin.psbt_derivation())
-                elif not isinstance(ik.node, bytes):
+                if not isinstance(ik.node, bytes):
                     if ik.is_provably_unspendable:
                         res.append([swab32(ik.node.my_fp())])
 
             for k in self.keys:
                 k = Key.from_string(k)
-                if k.origin:
+                if k.origin and k.derivation:
                     res.append(k.origin.psbt_derivation())
             return res
         return self.desc.xfp_paths()
+        
+    def get_xpubs(self):
+        xpubs = []
+        if self._desc is None:
+            for k in self.keys:
+                k = Key.from_string(k)
+                if k.derivation:
+                    xpubs.append(((k.origin.psbt_derivation(), k.node.serialize_raw(0x0488B21E if k.chain_type == "BTC" else 0x043587CF, False)), isinstance(k, MusigKey)))
+        else:
+            for k in self.desc.keys:
+                if k.derivation:
+                    xpubs.append(((k.origin.psbt_derivation(), k.node.serialize_raw(0x0488B21E if k.chain_type == "BTC" else 0x043587CF, False)), isinstance(k, MusigKey)))
+        return xpubs
 
     @classmethod
-    def find_match(cls, xfp_paths, addr_fmt=None):
+    def find_match(cls, xfp_paths, xpubs, addr_fmt=None):
         for rv in cls.iter_wallets():
             if addr_fmt is not None:
                 if rv.addr_fmt != addr_fmt:
                     continue
-            if rv.matching_subpaths(xfp_paths):
+            if rv.matching_subpaths(xfp_paths) and rv.matching_xpubs(xpubs):
                 return rv
         return None
 
     def matching_subpaths(self, xfp_paths):
         my_xfp_paths = self.xfp_paths()
+        my_xfp_paths.sort()
         if len(xfp_paths) != len(my_xfp_paths):
             return False
-        for x in my_xfp_paths:
+        for i, x in enumerate(my_xfp_paths):
             prefix_len = len(x)
-            for y in xfp_paths:
-                if x == y[:prefix_len]:
-                    break
-            else:
+            if x != xfp_paths[i][:prefix_len]:
                 return False
+        return True
+        
+    def matching_xpubs(self, xpubs):
+        my_xpubs = self.get_xpubs()
+        for my_xpub in my_xpubs:
+            match = None
+            if xpubs:
+                for xpub in xpubs:
+                    xfp_path = list(ustruct.unpack_from('<%dI' % (len(xpub[0])//4), xpub[0], 0))
+                    if xpub[1][45:] == my_xpub[0][1][45:]:
+                        if xpub[1] == my_xpub[0][1] and xfp_path == my_xpub[0][0]:
+                            # matching xpub found
+                            break
+                        # wrong xpub
+                        return False
+                else:
+                    # no matching xpub found
+                    if not my_xpub[1] or my_xpub[0][1][13:45] != MUSIG_CHAINCODE:
+                        return False
+            else:
+                if my_xpub[1] and my_xpub[1][13:45] != MUSIG_CHAINCODE:
+                    return False
         return True
 
     def subderivation_indexes(self, xfp_paths):
@@ -199,7 +232,7 @@ class MiniScriptWallet(BaseStorageWallet):
         for x in my_xfp_paths:
             prefix_len = len(x)
             for y in xfp_paths:
-                if x == y[:prefix_len]:
+                if x == y[:prefix_len] and y[prefix_len:]:
                     to_derive = tuple(y[prefix_len:])
                     res.add(to_derive)
 
@@ -290,6 +323,17 @@ class MiniScriptWallet(BaseStorageWallet):
                             # it is unspendable, BUT not unspend(
                             s += "\n (%s)" % note
                 s += "\n\n"
+            elif isinstance(key, MusigKey):
+                s += 'MuSig Key:\n\n'
+                for aggkey in key.aggkeys:
+                    xfp, deriv, xpub = aggkey.to_cc_data()
+                    if key.derivation:
+                        s += '%s:\n  %s\n\n%s\n\n' % (xfp2str(xfp), deriv, xpub)
+                    else:
+                        s += '%s:\n  %s\n\n%s/%s\n\n' % (xfp2str(xfp), deriv, xpub,
+                                                         aggkey.derivation.to_string())
+                if key.derivation:
+                    s += 'Chain-Code:\n%s\n\nDerivation:\n%s\n\n' % (b2a_hex(key.node.chain_code()).decode(), key.derivation.to_string())
             else:
                 xfp, deriv, xpub = key.to_cc_data()
                 s += '%s:\n  %s\n\n%s/%s\n\n' % (xfp2str(xfp), deriv, xpub,
@@ -300,22 +344,25 @@ class MiniScriptWallet(BaseStorageWallet):
         msg = ""
         if self.taproot:
             msg = self.taproot_internal_key_detail()
-            msg += "Taproot tree keys:\n\n"
+            if self.desc.tapscript:
+                msg += "Taproot tree keys:\n\n"
 
-        orig_keys = OrderedDict()
-        for k in self.keys:
-            if isinstance(k, str):
-                k = Key.from_string(k)
-            if k.origin not in orig_keys:
-                orig_keys[k.origin] = []
-            orig_keys[k.origin].append(k)
+        if not self.taproot or self.desc.tapscript:
+            orig_keys = OrderedDict()
+            keys = self.keys if not self.desc.tapscript else self.desc.tapscript.keys
+            for k in keys:
+                if isinstance(k, str):
+                    k = Key.from_string(k)
+                if k.origin not in orig_keys:
+                    orig_keys[k.origin] = []
+                orig_keys[k.origin].append(k)
 
-        for idx, k_lst in enumerate(orig_keys.values()):
-            subderiv = True if len(k_lst) == 1 else False
-            if idx:
-                msg += '\n---===---\n\n'
+            for idx, k_lst in enumerate(orig_keys.values()):
+                subderiv = True if len(k_lst) == 1 else False
+                if idx:
+                    msg += '\n---===---\n\n'
 
-            msg += '@%s:\n  %s\n\n' % (idx, k_lst[0].to_string(subderiv=subderiv))
+                msg += '@%s:\n  %s\n\n' % (idx, k_lst[0].to_string(subderiv=subderiv))
 
         await ux_show_story(msg)
 
@@ -382,13 +429,14 @@ class MiniScriptWallet(BaseStorageWallet):
             if scripts:
                 if d.tapscript:
                     script = d.tapscript.script_tree(d.tapscript.tree)
-                else:
+                elif d.miniscript:
                     script = b2a_hex(ser_string(d.miniscript.compile())).decode()
 
-            if d.tapscript:
+            if d.taproot:
+                musig_der_keys = sum((k.aggkeys for k in d.keys if isinstance(k, MusigKey) and k.derivation), [])
                 yield (idx,
                        addr,
-                       ["[%s]" % str(k.origin) for k in d.keys],
+                       ["[%s]" % str(k.origin) for k in d.keys if k.derivation and k not in musig_der_keys],
                        script,
                        d.key.serialize(),
                        str(d.key.origin) if d.key.origin else "")
@@ -849,6 +897,36 @@ class Raw20(Raw):
     LEN = 20
     def __len__(self):
         return 21
+        
+class RawCode:
+    TYPE = "B"
+    
+    def __init__(self, raw):
+        self.script = raw
+            
+    @classmethod
+    def read_from(cls, s, taproot=False):
+        raw = ""
+        char = s.read(1)
+        while char not in b",)":
+            raw += char.decode()
+            char = s.read(1)
+            
+        s.seek(-1, 1)
+        return cls(a2b_hex(raw))
+        
+    def to_string(self, *args, **kwargs):
+        return b2a_hex(self.script).decode()
+        
+    def compile(self):
+        return self.script
+        
+    def __len__(self):
+        return len(self.script)
+        
+    @property
+    def type(self):
+        return self.TYPE
 
 
 class Miniscript:
@@ -932,6 +1010,7 @@ class Miniscript:
         # number of arguments, classes of arguments, compile function, type, validity checker
         MiniscriptCls = OPERATORS[OPERATOR_NAMES.index(op)]
         args = MiniscriptCls.read_arguments(s, taproot=taproot)
+        args += MiniscriptCls.read_ext_arguments(s)
         miniscript = MiniscriptCls(*args, taproot=taproot)
         for w in reversed(wrappers):
             if w not in WRAPPER_NAMES:
@@ -971,6 +1050,10 @@ class Miniscript:
             if char != b")":
                 raise MiniscriptException("Expected ) got %s" % (char + s.read()))
         return args
+        
+    @classmethod
+    def read_ext_arguments(cls, s):
+        return []
 
     def to_string(self, external=True, internal=True):
         # meh
@@ -1583,6 +1666,103 @@ class Sortedmulti_a(Multi_a):
         return script
 
 
+class Musig(Miniscript):
+    # <agg-key> CHECKSIG
+    NAME = "musig"
+    NARGS = None
+    ARGCLS = Key
+    TYPE = "B"
+    
+    def __init__(self, *args, **kwargs):
+        self.args = list(args)
+        self.taproot = kwargs.get("taproot", False)
+        self.musig_key = kwargs.get("musig_key", None)
+        cc = None
+        der = None
+        assert self.taproot
+        if not self.musig_key:
+            keys = []
+            for k in self.args:
+                if isinstance(k, KeyDerivationInfo):
+                    der = k
+                    continue
+                if isinstance(k, bytes):
+                    cc = k
+                    continue
+                assert isinstance(k, Key)
+                keys.append(k)
+                keys[-1].isAgg = True
+                assert keys[-1].chain_type == keys[0].chain_type, "Mixing chain types in aggregate key"
+                 
+            if der:
+                self.args.pop()
+            if cc:
+                self.args.pop()
+            self.musig_key = MusigKey(derivation=der, chain_type=keys[0].chain_type, aggkeys=keys, chain_code=cc)
+    
+    def inner_compile(self):
+        from opcodes import OP_CHECKSIG
+        key = self.musig_key.serialize()
+        assert len(key) == 32, "taproot key must be 32 bytes"
+        return ser_compact_size(len(key)) + key + bytes([OP_CHECKSIG])
+
+    def __len__(self):
+        return 34
+        
+    @property
+    def keys(self):
+        return [self.musig_key] + self.musig_key.aggkeys
+    # TO DELTE    
+    #def agg_keys(self):
+    #    return [self.musig_key]
+        
+    def derive(self, idx, key_map=None, change=False):
+        return type(self)(*self.args, taproot=self.taproot, musig_key=self.musig_key.derive(idx, change))
+        
+    def to_string(self, external=True, internal=True):
+        return self.musig_key.to_string()
+        
+    @classmethod
+    def read_ext_arguments(cls, s):
+        args = []
+        char = s.read(1)      
+        if char == b"/":
+            char = s.read(1)
+            if char == b"c":
+                prefix, char = read_until(s, b"(")
+                if char != b"(":
+                    raise ValueError("Invalid chaincode in musig derivation - missing (")
+            
+                if prefix != b"c":
+                    raise ValueError("Invalid chaincode in musig derivation - got c%s" % str(prefix))
+                    
+                cc, char = read_until(s, b")")
+                if char != b")":
+                    raise ValueError("Invalid chaincode in musig derivation - missing )")
+                    
+                char = s.read(1)
+                if char != b"/":
+                    raise ValueError("Invalid chaincode in musig derivation - missing /")
+                    
+                args.append(a2b_hex(cc))
+            else:
+               s.seek(-1, 1) 
+                
+            der, char = read_until(s, b"<,)")
+            if char == b"<":
+                der += b"<"
+                branch, char = read_until(s, b">")
+                if char is None:
+                    raise ValueError("Failed reading the key, missing >")
+                der += branch + b">"
+                rest, char = read_until(s, b",)")
+                der += rest
+            args.append(KeyDerivationInfo.from_string(der.decode()))
+                
+        if char is not None:
+            s.seek(-1, 1)
+        return args
+
 class Pk(OneArg):
     # <key> CHECKSIG
     NAME = "pk"
@@ -1611,6 +1791,48 @@ class Pkh(OneArg):
         return self.len_args() + 4
 
 
+class RawScript(Miniscript):
+    # <RAW> <key>
+    NAME = "raw"
+    ARGCLS = (RawCode, Key)
+    NARGS = None
+    
+    def inner_compile(self):
+        comp = b""
+        for arg in self.args:
+            comp += arg.compile()
+        return comp
+    
+    @property
+    def type(self):
+        if len(self.args) > 1:
+            return "K"
+        return self.args[0].type
+        
+    def __len__(self):
+        return self.len_args()
+  
+  
+class CatScript(Miniscript):
+    # [X] [Y} ...
+    NAME = "cat"
+    ARGCLS = Miniscript
+    NARGS = None
+    
+    def inner_compile(self):
+        comp = b""
+        for arg in self.args:
+            comp += arg.compile()
+        return comp
+        
+    @property
+    def type(self):
+        return self.args[-1].type
+        
+    def __len__(self):
+        return self.len_args()
+
+
 OPERATORS = [
     PkK,
     PkH,
@@ -1633,8 +1855,11 @@ OPERATORS = [
     Sortedmulti,
     Multi_a,
     Sortedmulti_a,
+    Musig,
     Pk,
     Pkh,
+    RawScript,
+    CatScript,
 ]
 OPERATOR_NAMES = [cls.NAME for cls in OPERATORS]
 
@@ -1711,6 +1936,7 @@ class S(Wrapper):
 class C(Wrapper):
     # [X] CHECKSIG
     TYPE = "B"
+    NAME = "c"
 
     def inner_compile(self):
         return self.carg + b"\xac"
