@@ -4,15 +4,17 @@
 #
 from ustruct import unpack_from, unpack, pack
 from ubinascii import hexlify as b2a_hex
+from ubinascii import unhexlify as a2b_hex
 from utils import xfp2str, B2A, keypath_to_str, validate_derivation_path_length
-from utils import seconds2human_readable, datetime_from_timestamp, datetime_to_str, problem_file_line
-import stash, gc, history, sys, ngu, ckcc, chains
+from utils import seconds2human_readable, datetime_from_timestamp, datetime_to_str, problem_file_line, swab32
+import stash, gc, history, sys, ngu, ckcc, chains, ustruct
 from uhashlib import sha256
 from uio import BytesIO
 from sffile import SizerFile
 from chains import taptweak, tapleaf_hash
 from miniscript import MiniScriptWallet
 from multisig import MultisigWallet, disassemble_multisig_mn
+from desc_utils import MusigKey, SECP256K1_ORDER, MUSIG_CHAINCODE
 from exceptions import FatalPSBTIssue, FraudulentChangeOutput
 from serializations import ser_compact_size, deser_compact_size, hash160
 from serializations import CTxIn, CTxInWitness, CTxOut, ser_string, COutPoint
@@ -36,6 +38,11 @@ from public_constants import (
     PSBT_IN_OUTPUT_INDEX, PSBT_IN_SEQUENCE, PSBT_IN_REQUIRED_TIME_LOCKTIME,
     PSBT_IN_REQUIRED_HEIGHT_LOCKTIME, MAX_PATH_DEPTH, MAX_SIGNERS
 )
+
+# BIP-373
+PSBT_IN_MUSIG2_PARTICIPANT_PUBKEYS = const(0x1a)
+PSBT_IN_MUSIG2_PUB_NONCE           = const(0x1b)
+PSBT_IN_MUSIG2_PARTIAL_SIG         = const(0x1c) 
 
 psbt_tmp256 = bytearray(256)
 
@@ -689,7 +696,8 @@ class psbtInputProxy(psbtProxy):
         'required_key', 'scriptSig', 'amount', 'scriptCode', 'previous_txid',
         'prevout_idx', 'sequence', 'req_time_locktime', 'req_height_locktime', 'taproot_key_sig',
         'taproot_merkle_root', 'taproot_script_sigs', 'taproot_scripts', "use_keypath", "subpaths",
-        "taproot_subpaths", "taproot_internal_key", "part_sig"
+        "taproot_subpaths", "taproot_internal_key", "taproot_output_key", "part_sig", "use_musig", 
+        "musig_participants", "musig_pub_nonces", "musig_part_sigs"
     )
 
     def __init__(self, fd, idx):
@@ -725,12 +733,18 @@ class psbtInputProxy(psbtProxy):
         # self.taproot_merkle_root = None           # will be empty if non-taproot
         # self.taproot_script_sigs = None           # will be empty if non-taproot
         # self.taproot_scripts = None               # will be empty if non-taproot
+        # self.taproot_output_key                   # will be empty if non-taproot
 
         #self.previous_txid = None
         #self.prevout_idx = None
         #self.sequence = None
         #self.req_time_locktime = None
         #self.req_height_locktime = None
+        
+        #self.musig_participants = None
+        #self.musig_pub_nonces = None
+        #self.musig_part_sigs = None
+        #self.musig_aggkey_map = None
 
         self.parse(fd)
 
@@ -749,12 +763,28 @@ class psbtInputProxy(psbtProxy):
         # not needed at this point as we do not support tapscript
         # parsing this field without actual tapscript support is just a waste of memory
         parsed_taproot_scripts = {}
+        parity = 1 if self.taproot_output_key[0] == 0x03 else 0
+        
         for key in self.taproot_scripts:
             assert len(key) > 32  # "PSBT_IN_TAP_LEAF_SCRIPT control block is too short"
             assert (len(key) - 1) % 32 == 0  # "PSBT_IN_TAP_LEAF_SCRIPT control block is not valid"
             script = self.get(self.taproot_scripts[key])
             assert len(script) != 0  # "PSBT_IN_TAP_LEAF_SCRIPT cannot be empty"
             leaf_script = (script[:-1], int(script[-1]))
+            cb_par = int().from_bytes(key[0] & 0x01, 'big')
+            if cb_par != parity:
+                raise FatalPSBTIssue("Unexpected parity bit in control block - Expected: %d, CB: %d" % (parity, cb_par))
+            if key[0] & 0xFE != leaf_script[1]:
+                raise FatalPSBTIssue("Leaf version of script does not match the provided control block - Script: %s, CB: %s" % (b2a_hex(leaf_script[1]).decode(), b2a_hex(key[0] & 0xFE).decode()))
+            if key[1:33] != self.taproot_internal_key:
+                raise FatalPSBTIssue("Internal key does not match the provided control block - Key: %s, CB: %s" % (b2a_hex(self.taproot_internal_key).decode(), b2a_hex(key[1:33] & 0xFE).decode()))
+            lh = tapleaf_hash(leaf_script[0], leaf_script[1])
+            bh = lh
+            for i in range((len(key)-33) // 32):
+                branch = b''.join([bh, key[33+32*i:65+32*i]].sort())
+                bh = ngu.secp256k1.tagged_sha256(b"TapBranch", branch)
+            if bh != self.taproot_merkle_root:
+                raise FatalPSBTIssue("Calculated merkle root from control block data does not match - Script-Hash: %s" % b2a_hex(lh).decode())
             if leaf_script not in self.taproot_scripts:
                 parsed_taproot_scripts[leaf_script] = set()
             parsed_taproot_scripts[leaf_script].add(key)
@@ -785,6 +815,37 @@ class psbtInputProxy(psbtProxy):
             return
 
         return is_timebased, res
+        
+    def parse_musig_participants(self):
+        parsed_musig_participants = {}
+        for key in self.musig_participants:
+            assert len(key) == 33, "MuSig aggregate key must be 33 bytes"
+            assert key[0] == 0x02 or key[0] == 0x03, "MuSig aggregate key must be a compressed public key"
+            assert self.musig_participants[key][1] % 33 == 0, "Participants of aggregate key must be 33 bytes"
+            participants = self.get(self.musig_participants[key])
+            parsed_musig_participants[key] = []
+            for i in range(self.musig_participants[key][1] // 33):
+                parsed_musig_participants[key].append(participants[i*33:(i+1)*33])
+        self.musig_participants = parsed_musig_participants
+        
+    def parse_musig_pub_nonces(self):
+        parsed_musig_pub_nonces = {}
+        for key in self.musig_pub_nonces:
+            assert len(key) == 98 or len(key) == 66, "MuSig nonce key must be 98 or 66 bytes"
+            assert (key[0] == 0x02 or key[0] == 0x03) and (key[33] == 0x02 or key[33] == 0x03), "MuSig nonce key must begin with 2 compressed public keys"
+            assert self.musig_pub_nonces[key][1] == 66, "Public nonce must be 66 bytes"
+            pub_nonce = self.get(self.musig_pub_nonces[key])
+            parsed_musig_pub_nonces[key] = []
+            for i in range(2):
+                parsed_musig_pub_nonces[key].append(pub_nonce[i*33:(i+1)*33])
+        self.musig_pub_nonces = parsed_musig_pub_nonces
+        
+    def parse_musig_part_sigs(self):
+        for key in self.musig_part_sigs:
+            assert len(key) == 98 or len(key) == 66, "MuSig nonce key must be 98 or 66 bytes"
+            assert (key[0] == 0x02 or key[0] == 0x03) and (key[33] == 0x02 or key[33] == 0x03), "MuSig nonce key must begin with 2 compressed public keys"
+            assert self.musig_part_sigs[key][1] == 32, "Partial signature must be 32 bytes"
+            self.musig_part_sigs[key] = self.get(self.musig_part_sigs[key])
 
     def validate(self, idx, txin, my_xfp, parent):
         # Validate this txn input: given deserialized CTxIn and maybe witness
@@ -797,6 +858,10 @@ class psbtInputProxy(psbtProxy):
 
         if self.taproot_internal_key:
             assert self.taproot_internal_key[1] == 32  # "PSBT_IN_TAP_INTERNAL_KEY length != 32"
+            self.taproot_internal_key = self.get(self.taproot_internal_key)
+            self.taproot_merkle_root = self.get(self.taproot_merkle_root) if self.taproot_merkle_root else None
+            tweak = ngu.secp256k1.tagged_sha256(b"TapTweak", self.taproot_internal_key + (self.taproot_merkle_root if self.taproot_merkle_root else b''))
+            self.taproot_output_key = ngu.secp256k1.pubkey(b'\x02' + self.taproot_internal_key).xonly_tweak_add(tweak).to_bytes()
 
         if self.taproot_script_sigs:
             self.parse_taproot_script_sigs()
@@ -808,6 +873,38 @@ class psbtInputProxy(psbtProxy):
 
         # rework the pubkey => subpath mapping
         self.parse_subpaths(my_xfp, parent.warnings)
+        
+        # parse musig keys
+        if self.musig_participants:
+            self.parse_musig_participants()
+            
+        if self.musig_pub_nonces:
+            self.parse_musig_pub_nonces()
+            
+        if self.musig_part_sigs:
+            self.parse_musig_part_sigs()
+            
+        # create a MuSig key derivation map
+        self.musig_aggkey_map = {}
+        for aggKey in self.musig_participants:
+            tacc = 0
+            agg_node = ngu.hdnode.HDNode().from_chaincode_pubkey(MUSIG_CHAINCODE, aggKey)
+            agg_fp = swab32(agg_node.my_fp())
+            
+            for derivKey, lhs_path in self.taproot_subpaths.items():
+                if lhs_path[1] == agg_fp:
+                    for idx in lhs_path[2:]:
+                        hmac = ngu.hmac.hmac_sha512(agg_node.chain_code(), agg_node.pubkey() + idx.to_bytes(4, 'big'))
+                        t = int().from_bytes(hmac[:32], 'big')
+                        assert t < SECP256K1_ORDER, "Tweak is not smaller than the curve order"
+                        tacc = (tacc + t) % SECP256K1_ORDER
+                        agg_node.derive(idx, False)
+                        assert agg_node.chain_code() == hmac[32:], "Invalid derivation in MuSig"
+                    if agg_node.pubkey()[1:] == derivKey:
+                        self.musig_aggkey_map[aggKey] = (agg_node.pubkey(), tacc)
+                        break
+            else:
+                self.musig_aggkey_map[aggKey] = (aggKey, 0)
 
         if self.part_sig:
             # How complete is the set of signatures so far?
@@ -907,7 +1004,6 @@ class psbtInputProxy(psbtProxy):
         # - which pubkey needed
         # - scriptSig value
         # - also validates redeem_script when present
-        merkle_root = None
         self.amount = utxo.nValue
 
         if (not self.subpaths and not self.taproot_subpaths) or self.fully_signed:
@@ -993,16 +1089,17 @@ class psbtInputProxy(psbtProxy):
 
         elif addr_type == 'p2tr':
             pubkey = addr_or_pubkey
-            merkle_root = None if self.taproot_merkle_root is None else self.get(self.taproot_merkle_root)
+            assert self.taproot_internal_key
+            if self.taproot_output_key[1:] != pubkey:
+                raise FatalPSBTIssue('Internal key or merkle root in PSBT is wrong')
             if len(self.taproot_subpaths) == 1:
                 # keyspend without a script path
-                assert merkle_root is None, "merkle_root should not be defined for simple keyspend"
+                assert self.taproot_merkle_root is None, "merkle_root should not be defined for simple keyspend"
                 xonly_pubkey, lhs_path = list(self.taproot_subpaths.items())[0]
                 lhs, path = lhs_path[0], lhs_path[1:]  # meh - should be a tuple
                 assert not lhs, "LeafHashes have to be empty for internal key"
                 if path[0] == my_xfp:
-                    output_key = taptweak(xonly_pubkey)
-                    if output_key == pubkey:
+                    if self.taproot_internal_key == xonly_pubkey:
                         which_key = xonly_pubkey
             else:
                 # tapscript (is always miniscript wallet)
@@ -1011,22 +1108,60 @@ class psbtInputProxy(psbtProxy):
                     lhs, path = lhs_path[0], lhs_path[1:]  # meh - should be a tuple
                     # ignore keys that does not have correct xfp specified in PSBT
                     if path[0] == my_xfp:
-                        assert merkle_root is not None, "Merkle root not defined"
                         if not lhs:
-                            output_key = taptweak(xonly_pubkey, merkle_root)
-                            if output_key == pubkey:
-                                which_key = xonly_pubkey
-                                # if we find a possibiity to spend keypath (internal_key) - we do keypath
-                                # even though script path is available
-                                self.use_keypath = True
+                            if self.taproot_merkle_root:
+                                if self.taproot_internal_key == xonly_pubkey:
+                                    which_key = xonly_pubkey
+                                    # if we find a possibility to spend keypath (internal_key) - we do keypath
+                                    # even though script path is available
+                                    self.use_keypath = True
+                                    break
+                                    
+                        # check whether the key is part of MuSig aggregation
+                        FoundAggKey = []
+                        pk = None
+                        if self.musig_participants:
+                            for aggKey in self.musig_participants:
+                                for partKey in self.musig_participants[aggKey]:
+                                    if partKey[1:] == xonly_pubkey:
+                                        pk = partKey
+                                        break
+                                else:
+                                    continue
+                                # Found a matching aggregate key
+                                FoundAggKey.append(self.musig_aggkey_map[aggKey][0])
+                        
+                        addKey = False
+                        # check if one of the aggregate keys is the internal key
+                        for aggKey in FoundAggKey:
+                            if aggKey[1:] == self.taproot_internal_key:
+                                # check if there is already a partial signature
+                                if not self.musig_part_sigs or (pk + self.taproot_output_key) not in self.musig_part_sigs:
+                                    addKey = True
+                                    
+                        if lhs and self.taproot_scripts:
+                            assert self.taproot_merkle_root, "Merkle root is not defined, even tough there is a script path"
+                            # determine the available leaf hashes
+                            lhs_available = [tapleaf_hash(script, lv) for (script, lv) in self.taproot_scripts.keys()]
+                            lhs = [lh for lh in lhs if lh in lhs_available]
+                            for lh in lhs:
+                                # check for a script signature
+                                if self.taproot_script_sigs and (xonly_pubkey + lh) in taproot_script_sigs:
+                                    # Found signature, try next leaf
+                                    continue
+                                # check for a partial MuSig signature
+                                for aggKey in FoundAggKey:
+                                    if self.musig_part_sigs and (pk + aggKey + lh) in self.musig_part_sigs:
+                                        # Found signature, try next leaf
+                                        continue
+                                # no signature found, add the key
+                                addKey = True
                                 break
-                        else:
-                            internal_key = self.get(self.taproot_internal_key)
-                            output_pubkey = taptweak(internal_key, merkle_root)
+     
+                        if addKey:
                             if not which_key:
                                 which_key = set()
-                            if pubkey == output_pubkey:
-                                which_key.add(xonly_pubkey)
+                            which_key.add(xonly_pubkey)
 
         elif addr_type == 'p2pk':
             # input is single public key (less common)
@@ -1072,13 +1207,23 @@ class psbtInputProxy(psbtProxy):
 
         if self.is_miniscript and which_key:
             try:
-                xfp_paths = [item[1:] for item in self.taproot_subpaths.values() if len(item[1:]) > 1]
+                xfp_paths = [item[1:] for item in self.taproot_subpaths.values() for i in range(max(len(item[0]), 1)) if len(item[1:]) > 1]
+                if self.musig_participants:
+                    for xonly_pubkey, lhs_path in self.taproot_subpaths.items():
+                        if lhs_path[0]:
+                            for aggKey in self.musig_participants:
+                                if self.musig_aggkey_map[aggKey][1:] == self.taproot_internal_key:
+                                    for partKey in self.musig_participants[aggKey]:
+                                        if partKey[1:] == xonly_pubkey:
+                                            # There is a subpath that is used for script path and MuSig key path
+                                            # it has to be added additionally to the path list, so it can be matched ot the correct wallet
+                                            xfp_paths.append(lhs_path[1:])
             except AttributeError:
                 xfp_paths = list(self.subpaths.values())
 
             xfp_paths.sort()
             if not psbt.active_miniscript:
-                wal = MiniScriptWallet.find_match(xfp_paths)
+                wal = MiniScriptWallet.find_match(xfp_paths, psbt.xpubs)
                 if not wal:
                     raise FatalPSBTIssue('Unknown miniscript wallet')
                 psbt.active_miniscript = wal
@@ -1087,7 +1232,7 @@ class psbtInputProxy(psbtProxy):
             try:
                 # contains PSBT merkle root verification
                 psbt.active_miniscript.validate_script_pubkey(utxo.scriptPubKey,
-                                                              xfp_paths, merkle_root)
+                                                              xfp_paths, self.taproot_merkle_root)
             except BaseException as e:
                 raise FatalPSBTIssue('Input #%d: %s\n\n' % (my_idx, e) + problem_file_line(e))
 
@@ -1171,6 +1316,18 @@ class psbtInputProxy(psbtProxy):
             self.req_time_locktime = unpack("<I", self.get(val))[0]
         elif kt == PSBT_IN_REQUIRED_HEIGHT_LOCKTIME:
             self.req_height_locktime = unpack("<I", self.get(val))[0]
+        elif kt == PSBT_IN_MUSIG2_PARTICIPANT_PUBKEYS:
+            if self.musig_participants is None:
+                self.musig_participants = {}
+            self.musig_participants[key[1:]] = val
+        elif kt == PSBT_IN_MUSIG2_PUB_NONCE:
+            if self.musig_pub_nonces is None:
+                self.musig_pub_nonces = {}
+            self.musig_pub_nonces[key[1:]] = val
+        elif kt == PSBT_IN_MUSIG2_PARTIAL_SIG:
+            if self.musig_part_sigs is None:
+                self.musig_part_sigs = {}
+            self.musig_part_sigs[key[1:]] = val
         else:
             # including: PSBT_IN_FINAL_SCRIPTSIG, PSBT_IN_FINAL_SCRIPTWITNESS
             self.unknown = self.unknown or {}
@@ -1226,6 +1383,24 @@ class psbtInputProxy(psbtProxy):
             for (script, leaf_ver), control_blocks in self.taproot_scripts.items():
                 for control_block in control_blocks:
                     wr(PSBT_IN_TAP_LEAF_SCRIPT, script + pack("B", leaf_ver), control_block)
+                    
+        if self.musig_participants:
+            for part in self.musig_participants:
+                if isinstance(self.musig_participants[part], tuple):
+                    wr(PSBT_IN_MUSIG2_PARTICIPANT_PUBKEYS, self.musig_participants[part], part)
+                else:
+                    wr(PSBT_IN_MUSIG2_PARTICIPANT_PUBKEYS, b''.join(self.musig_participants[part]), part)
+                    
+        if self.musig_pub_nonces:
+            for k in self.musig_pub_nonces:
+                if isinstance(self.musig_pub_nonces[k], tuple):
+                    wr(PSBT_IN_MUSIG2_PUB_NONCE, self.musig_pub_nonces[k], k)
+                else:
+                    wr(PSBT_IN_MUSIG2_PUB_NONCE, b''.join(self.musig_pub_nonces[k]), k)
+                    
+        if self.musig_part_sigs:
+            for k in self.musig_part_sigs:
+                wr(PSBT_IN_MUSIG2_PARTIAL_SIG, self.musig_part_sigs[k], k)
 
         if is_v2:
             wr(PSBT_IN_PREVIOUS_TXID, self.previous_txid)
@@ -2145,8 +2320,203 @@ class psbtObject(psbtProxy):
         for idx, outp in enumerate(self.outputs):
             outp.serialize(out_fd, self.is_v2)
             out_fd.write(b'\0')
+            
+    @staticmethod
+    def generate_musig_nonce(sk, pk, aggpk, digest):
+        assert len(sk) == 32
+        assert len(pk) == 33
+        assert len(aggpk) == 32
+        assert len(digest) == 32
+        rand = bytearray(ngu.secp256k1.tagged_sha256(b"MuSig/aux", ngu.random.bytes(32)))
+        
+        for i in range(len(rand)):
+            rand[i] = rand[i] ^ sk[i]
+            
+        pubnonce = []
+        secnonce = []
+        
+        for i in range(2):
+            k = ngu.secp256k1.tagged_sha256(b"MuSig/nonce", rand + b'\x21' + pk + b'\x20' + aggpk + b'\x01' + b'0x20' + b'0x00'*7 + digest + b'\x00'*4 + i.to_bytes(1, 'big'))
+            assert 0 < int().from_bytes(k, 'big') < SECP256K1_ORDER, "Generated invalid nonce by chance"
+            keypair = ngu.secp256k1.keypair(k)
+            pubnonce.append(keypair.pubkey().to_bytes())
+            secnonce.append(keypair.privkey())
 
-    def sign_it(self):
+        return (secnonce, pubnonce)
+        
+    @staticmethod    
+    def verify_partial_signature(psig, pubnonce, pk, aggkey, pubkeys, gacc, digest, gR, b, e):
+        s = int().from_bytes(psig, 'big')
+        assert s < SECP256K1_ORDER
+        Re = ngu.secp256k1.pubkey(pubnonce[0]).combine(ngu.secp256k1.pubkey(pubnonce[1]).tweak_mul(b.to_bytes(32, 'big'))).tweak_mul(int(gR).to_bytes(32, 'big'))
+        a = MusigKey.aggregate_key_coeff(pubkeys, pk)
+        g = ((-1 % SECP256K1_ORDER if aggkey[0] == 0x03 else 1) * gacc) % SECP256K1_ORDER
+        if ngu.secp256k1.keypair(psig).pubkey().to_bytes() != Re.combine(ngu.secp256k1.pubkey(pk).tweak_mul(((e*a*g) % SECP256K1_ORDER).to_bytes(32, 'big'))).to_bytes():
+            raise FatalPSBTIssue("Partial signature verification failed\n\npsig: %s\n\npubnonce: %s\n%s" % (b2a_hex(psig).decode(), b2a_hex(pubnonce[0]).decode(), b2a_hex(pubnonce[1]).decode()))
+            
+        return
+        
+    def sign_musig(self, node, secnonce, pubnonce, aggKey, pubkeys, gacc, digest, gR, b, e):            
+        k = [(int().from_bytes(secnonce_key, 'big') * gR) % SECP256K1_ORDER for secnonce_key in secnonce]
+        
+        # calculate the partial signature
+        a = MusigKey.aggregate_key_coeff(pubkeys, node.pubkey())
+        g = -1 % SECP256K1_ORDER if aggKey[0] == 0x03 else 1
+        d = int().from_bytes(node.privkey(), 'big')
+        assert 0 < d < SECP256K1_ORDER, "Invalid private key"
+        sk = (g * gacc * d) % SECP256K1_ORDER
+        s = (k[0] + b*k[1] + e*a*sk) % SECP256K1_ORDER
+        psig = s.to_bytes(32, 'big')
+        self.verify_partial_signature(psig, pubnonce, node.pubkey(), aggKey, pubkeys, gacc, digest, gR, b, e)
+        return psig
+            
+    async def handle_musig(self, node, inp, musig, digest, leaf_hash=None):
+        from glob import dis
+        from ux import ux_show_story
+        # check that the MuSig is contained in the PSBT
+        # if everything is valid - check whether we have a valid nonce
+        # if not, this is signing round 1 - generate a nonce and store it
+        # after storing the nonce, abort
+        # if we have a nonce already stored,
+        # check that the stored nonce matches our public nonce in PSBT
+        # if not, this may be an old nonce and this is still signing round 1
+        # regenerate a nonce and overwrite it
+        # if the stored nonce is valid, this is signing round 2
+        # check that the nonces of all signers are in the PSBT
+        # aggregate the nonce and generate partial signature
+        # if all partial signatures of the remaining signers are provided,
+        # calculate the combined signature and store it in the PSBT
+        tacc = 0
+        gacc = 1
+        aggKey = None
+        
+        if not inp.musig_participants:
+            raise FatalPSBTIssue("No MuSig participants specified in PSBT")
+            
+        for k, parts in inp.musig_participants.items():
+            if parts == musig.sorted_keys:
+                aggKey = k
+                break
+        else:
+            raise FatalPSBTIssue("Required MuSig participant not specified in PSBT - %s" % musig.to_string())
+            
+        
+        if aggKey != musig.node.pubkey():
+            # MuSig aggregate must be derived, before being used
+            if not musig.node.pubkey()[1:] in inp.taproot_subpaths:
+                raise FatalPSBTIssue("MuSig key is derived, but no matching subpath found in PSBT - %s" % musig.to_string())
+                
+            leaf_hashes = inp.taproot_subpaths[musig.node.pubkey()[1:]][0]
+            int_path = inp.taproot_subpaths[musig.node.pubkey()[1:]][1:]
+            skp = keypath_to_str(int_path)
+            
+            if leaf_hash:
+                if not leaf_hash in leaf_hashes:
+                    raise FatalPSBTIssue("Found key is not supposed to be in this script - Script-Hash: %s, Keypath: %s" % (b2a_hex(leaf_hash).decode(), skp))
+            else:
+                if leaf_hashes:
+                    raise FatalPSBTIssue("Found key is not supposed to be used in key spend - Keypath: %s" % skp)
+        
+            if inp.musig_aggkey_map[aggKey][0] != musig.node.pubkey():
+                raise FatalPSBTIssue("The derived aggregated key does not match the needed key - Derived Key: %s, Needed Key: %s" % (b2a_hex(inp.musig_aggkey_map[aggKey][0]).decode(), b2a_hex(musig.node.pubkey()).decode()))
+            
+            tacc = inp.musig_aggkey_map[aggKey][1]
+            aggKey = inp.musig_aggkey_map[aggKey][0]
+            
+        if not leaf_hash:
+            if aggKey[0] == 0x03:
+                gacc = -1 % SECP256K1_ORDER
+            tweak = aggKey[1:]
+            if inp.taproot_merkle_root is not None:
+                tweak += self.get(inp.taproot_merkle_root)
+            tweak = ngu.secp256k1.tagged_sha256(b"TapTweak", tweak)
+            t = int().from_bytes(tweak, 'big')
+            assert t < SECP256K1_ORDER, "Tweak is not smaller than the curve order"
+            tacc = (t + (gacc * tacc)) % SECP256K1_ORDER
+            # Apply the final tweak
+            aggKey = ngu.secp256k1.pubkey(aggKey).xonly_tweak_add(tweak).to_bytes()
+            
+        # check if our nonce is already in PSBT
+        # if the nonce is missing, this is signing round 1 and we can not provide a signature yet
+        musig_id = node.pubkey() + aggKey + (leaf_hash if leaf_hash else b'')
+        hasValidNonce = False
+        if inp.musig_pub_nonces and musig_id in inp.musig_pub_nonces:
+            # Try to read the encrypted nonce from the nvram
+            stored = settings.get('secnonce')
+            if stored:
+                secbytes = a2b_hex(stored)
+                assert len(secbytes) == 97
+                secnonce = [secbytes[:32], secbytes[32:64]]
+                if secbytes[64:] == node.pubkey():
+                    pubnonce = inp.musig_pub_nonces[musig_id]
+                    pubkeys = [ngu.secp256k1.keypair(key).pubkey().to_bytes() for key in secnonce]
+                    if pubkeys == pubnonce:
+                        hasValidNonce = True
+                    
+        if not hasValidNonce:
+            # Add a nonce to the psbt and abort signing, since we need the aggregated nonce first
+            secnonce, pubnonce = self.generate_musig_nonce(node.privkey(), node.pubkey(), aggKey[1:], digest)
+            if not inp.musig_pub_nonces:
+                inp.musig_pub_nonces = {}
+            inp.musig_pub_nonces[musig_id] = pubnonce
+            # Store the encrypted secret nonce, so it can be used during signing round 2
+            settings.put('secnonce', b2a_hex(b''.join(secnonce) + node.pubkey()).decode())
+            settings.save()
+        
+        # we have a valid nonce, check if the PSBT contains all required nonces
+        musig_ids = [partkey + aggKey + (leaf_hash if leaf_hash else b'') for partkey in musig.sorted_keys]
+        for i, tmp_id in enumerate(musig_ids):
+            if not tmp_id in inp.musig_pub_nonces:
+                if not hasValidNonce:
+                    # we just generated a nonce, so it is no error, if not all nonces are available
+                    # inform the user that the nonce was generated and abort
+                    await ux_show_story("Nonce generated and stored", title="MuSig")
+                    dis.fullscreen('Signing...')
+                    return None
+                for j in range(len(musig.aggkeys)):
+                    if musig.aggkeys[j].key_bytes() == musig.sorted_keys[i]:
+                        raise FatalPSBTIssue("PSBT does not contain the nonces of all signers - Missing Key: %s" % musig.aggkeys[j].to_string())
+                assert False, "Should never reach here"
+                
+        nonces = [inp.musig_pub_nonces[i] for i in musig_ids]
+        
+        # Calculate the aggregated nonce
+        aggnonceP = []
+        for j in range(2):
+            aggnonceP.append(ngu.secp256k1.pubkey(nonces[0][j]))
+            for i in range(len(nonces)-1):
+                aggnonceP[j] = aggnonceP[j].combine(ngu.secp256k1.pubkey(nonces[i+1][j]))
+        
+        aggnonce = [nonceP.to_bytes() for nonceP in aggnonceP]
+        b = int().from_bytes(ngu.secp256k1.tagged_sha256(b"MuSig/noncecoef", b''.join(aggnonce) + aggKey[1:] + digest), 'big') % SECP256K1_ORDER 
+        R = ngu.secp256k1.pubkey(aggnonce[0]).combine(ngu.secp256k1.pubkey(aggnonce[1]).tweak_mul(b.to_bytes(32, 'big'))).to_bytes()
+        e = int().from_bytes(ngu.secp256k1.tagged_sha256(b"BIP0340/challenge", R[1:] + aggKey[1:] + digest), 'big') % SECP256K1_ORDER
+        gR = (-1 % SECP256K1_ORDER) if R[0] == 0x03 else 1
+        psig = self.sign_musig(node, secnonce, pubnonce, aggKey, musig.sorted_keys, gacc, digest, gR, b, e)
+        if inp.musig_part_sigs is None:
+            inp.musig_part_sigs = {}
+        inp.musig_part_sigs[musig_id] = psig
+        
+        # check whether we have all needed signatures
+        if not all(sig_id in inp.musig_part_sigs for sig_id in musig_ids):
+            await ux_show_story("Partial signature generated", title="MuSig")
+            dis.fullscreen('Signing...')
+            return None
+            
+        # verify all partial signatures
+        for tmp_id in musig_ids:
+            self.verify_partial_signature(inp.musig_part_sigs[tmp_id], inp.musig_pub_nonces[tmp_id], tmp_id[:33], aggKey, musig.sorted_keys, gacc, digest, gR, b, e)
+            
+        # calculate the aggregated signature
+        g = (-1 % SECP256K1_ORDER) if aggKey[0] == 0x03 else 1
+        s = (e * g * tacc) % SECP256K1_ORDER
+        for tmp_id in musig_ids:
+            s = (s + int().from_bytes(inp.musig_part_sigs[tmp_id], 'big')) % SECP256K1_ORDER
+            
+        sig = R[1:] + s.to_bytes(32, 'big')
+        return sig   
+
+    async def sign_it(self):
         # txn is approved. sign all inputs we can sign. add signatures
         # - hash the txn first
         # - sign all inputs we have the key for
@@ -2236,17 +2606,19 @@ class psbtObject(psbtProxy):
                 tr_sh = []
                 inp.handle_none_sighash()
                 to_sign = []
+                musig_keys = []
                 if isinstance(inp.required_key, set) and (inp.is_multisig or inp.is_miniscript):
                     # need to consider a set of possible keys, since xfp may not be unique
                     for which_key in inp.required_key:
                         # get node required
-                        if inp.taproot_subpaths:  # this can be set to False even if we haev script ready, but can send keypath
+                        if inp.taproot_subpaths:  # this can be set to False even if we have script ready, but can send keypath
                             # tapscript
                             schnorrsig = True
                             # previously internal keys would be filtered here with if item[0]
                             # as per BIP-371 first item is leaf hashes which has to be empty for internal key
                             xfp_paths = [item[1:] for item in inp.taproot_subpaths.values()]
                             int_path = inp.taproot_subpaths[which_key][1:]
+                            leaf_hashes = inp.taproot_subpaths[which_key][0]
                             skp = keypath_to_str(int_path)
                         else:
                             xfp_paths = list(inp.subpaths.values())
@@ -2261,25 +2633,82 @@ class psbtObject(psbtProxy):
                             to_sign.append(node)
                         if len(which_key) == 32 and pu[1:] == which_key:
                             # get the script
-                            inner_tr_sh = []
                             assert self.active_miniscript
                             der_d = self.active_miniscript.derive_desc(xfp_paths)
-                            for (script, lv), cb in inp.taproot_scripts.items():
-                                target_leaf = None
-                                # always exact check/match the script, if we would generate such
-                                for leaf in der_d.tapscript.iter_leaves(der_d.tapscript.tree):
-                                    sc = leaf.compile()
-                                    if sc == script:
-                                        target_leaf = leaf
-                                        break
-                                else:
-                                    continue
-
-                                if which_key in [k.key_bytes() for k in target_leaf.keys]:
-                                    inner_tr_sh.append((script, lv))
-
-                            to_sign.append(node)
+                            
+                            # check whether the key is part of MuSig aggregation
+                            FoundAggKey = []
+                            inner_tr_sh = []
+                            inner_musig_keys =[]
+                            if inp.musig_participants:
+                                for aggKey in inp.musig_participants:
+                                    for partKey in inp.musig_participants[aggKey]:
+                                        if partKey == pu:
+                                            break
+                                    else:
+                                        continue
+                                    # Found a matching aggregate key
+                                    FoundAggKey.append(inp.musig_aggkey_map[aggKey][0])
+                        
+                            
+                            # check if one of the aggregate keys is the internal key
+                            for aggKey in FoundAggKey:
+                                if aggKey[1:] == inp.taproot_internal_key:
+                                    # check if there is already a partial signature
+                                    if not inp.musig_part_sigs or (pu + inp.taproot_output_key) not in inp.musig_part_sigs:
+                                        inner_tr_sh.append((None, None))
+                                        assert isinstance(der_d.key, MusigKey), "MuSig keyspend expected, but internal key is not aggregate"
+                                        inner_musig_keys.append(der_d.key)
+                                        
+                            if leaf_hashes and inp.taproot_scripts:
+                                for (script, lv) in inp.taproot_scripts.keys():
+                                    lh = tapleaf_hash(script, lv)
+                                    target_leaf = None
+                                    # always exact check/match the script, if we would generate such
+                                    for leaf in der_d.tapscript.iter_leaves(der_d.tapscript.tree):
+                                        sc = leaf.compile()
+                                        if sc == script:
+                                            target_leaf = leaf
+                                            break
+                                    else:
+                                        continue
+                                        
+                                    if not target_leaf:
+                                        raise FatalPSBTIssue("Invalid script provided in PSBT - Script-Hash: %s, Keypath: %s" % b2a_hex(lh).decode())
+                                      
+                                    # check for a script signature
+                                    if inp.taproot_script_sigs and (which_key + lh) in inp.taproot_script_sigs:
+                                        # Found signature, try next leaf
+                                        continue
+                                        
+                                    # check for a partial MuSig signature
+                                    for aggKey in FoundAggKey:
+                                        if inp.musig_part_sigs and (pu + aggKey + lh) in inp.musig_part_sigs:
+                                            # Found signature, try next leaf
+                                            continue
+                                        
+                                    if lh in leaf_hashes:
+                                        agg_keys = [k for k in target_leaf.keys if isinstance(k, MusigKeys)]
+                                        keys = [k for k in target_leaf.keys if not isinstance(k, MusigKeys)]
+                                        for k in keys:
+                                            if which_key == k.serialize() or pu == k.serialize():
+                                                inner_tr_sh.append((script, lv))
+                                                if k.isAgg:
+                                                    for agg in agg_keys:
+                                                        if k in agg.aggkeys:
+                                                            inner_musig_keys.append(agg)
+                                                            break
+                                                    else:
+                                                        assert False, "aggregate key was not found, even tough there is a MuSig key"
+                                                else:
+                                                    inner_musig_keys.append(None)
+                                                break
+                                     
+                            assert inner_musig_keys and inner_tr_sh
+                            assert len(inner_musig_keys) == len(inner_tr_sh)
+                            musig_keys.append(inner_musig_keys)
                             tr_sh.append(inner_tr_sh)
+                            to_sign.append(node)   
 
                 else:
                     # single pubkey <=> single key
@@ -2358,20 +2787,57 @@ class psbtObject(psbtProxy):
                     if schnorrsig:
                         if tr_sh:
                             # in tapscript keys are not tweaked, just sign with the key in the script
-                            for taproot_script, leaf_ver in tr_sh[i]:
-                                _key = (xonly_pk, tapleaf_hash(taproot_script, leaf_ver))
-                                if _key in inp.taproot_script_sigs:
-                                    continue
+                            for sh_idx, (taproot_script, leaf_ver) in enumerate(tr_sh[i]):
+                                if taproot_script:
+                                    digest = self.make_txn_taproot_sighash(in_idx, hash_type=inp.sighash,
+                                                                           scriptpath=True,
+                                                                           script=taproot_script, leaf_ver=leaf_ver)
+                                    
+                                    if musig_keys[i][sh_idx]:
+                                        # This key is part of a MuSig aggregate key
+                                        try:
+                                            _key = (inp.musig_aggkey_map[musig_keys[i][sh_idx].node.pubkey()], tapleaf_hash(taproot_script, leaf_ver))
+                                            sig = await self.handle_musig(node, inp, musig_keys[i][sh_idx], digest, leaf_hash=_key[1])
+                                            if not sig:
+                                                continue
+                                        except:
+                                            # private key no longer required
+                                            stash.blank_object(sk)
+                                            stash.blank_object(node)
+                                            del sk, node
+                                            raise
 
-                                digest = self.make_txn_taproot_sighash(in_idx, hash_type=inp.sighash,
-                                                                       scriptpath=True,
-                                                                       script=taproot_script, leaf_ver=leaf_ver)
-                                sig = ngu.secp256k1.sign_schnorr(sk, digest, ngu.random.bytes(32))
-                                if inp.sighash != SIGHASH_DEFAULT:
-                                    sig += bytes([inp.sighash])
-                                # in the common case of SIGHASH_DEFAULT, encoded as '0x00', a space optimization MUST be made by
-                                # 'omitting' the sighash byte, resulting in a 64-byte signature with SIGHASH_DEFAULT assumed
-                                inp.taproot_script_sigs[_key] = sig
+                                    else:
+                                        _key = (xonly_pk, tapleaf_hash(taproot_script, leaf_ver))
+                                        sig = ngu.secp256k1.sign_schnorr(sk, digest, ngu.random.bytes(32))
+                                        
+                                    if inp.sighash != SIGHASH_DEFAULT:
+                                        sig += bytes([inp.sighash])
+                                    # in the common case of SIGHASH_DEFAULT, encoded as '0x00', a space optimization MUST be made by
+                                    # 'omitting' the sighash byte, resulting in a 64-byte signature with SIGHASH_DEFAULT assumed
+                                    inp.taproot_script_sigs[_key] = sig
+                                        
+                                else:
+                                    assert musig_keys[i][sh_idx]
+                                    digest = self.make_txn_taproot_sighash(in_idx, hash_type=inp.sighash)
+                                    try:
+                                        sig = await self.handle_musig(node, inp, musig_keys[i][sh_idx], digest)
+                                        if not sig:
+                                            continue
+                                    except:
+                                        # private key no longer required
+                                        stash.blank_object(sk)
+                                        stash.blank_object(node)
+                                        del sk, node
+                                        raise
+                                    if inp.sighash != SIGHASH_DEFAULT:
+                                        sig += bytes([inp.sighash])
+                                    # in the common case of SIGHASH_DEFAULT, encoded as '0x00', a space optimization MUST be made by
+                                    # 'omitting' the sighash byte, resulting in a 64-byte signature with SIGHASH_DEFAULT assumed
+                                    inp.taproot_key_sig = sig
+                                    inp.use_keypath = True
+                                    break
+                                    
                         else:
                             # BIP 341 states: "If the spending conditions do not require a script path,
                             # the output key should commit to an unspendable script path instead of having no script path.

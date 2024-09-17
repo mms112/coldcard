@@ -9,7 +9,7 @@ from binascii import hexlify as b2a_hex
 from utils import cleanup_deriv_path, check_xpub, xfp2str, swab32
 from public_constants import AF_CLASSIC, AF_P2WPKH, AF_P2WPKH_P2SH, AF_P2TR
 from public_constants import AF_P2WSH, AF_P2WSH_P2SH, AF_P2SH, MAX_SIGNERS, MAX_TR_SIGNERS
-from desc_utils import parse_desc_str, append_checksum, descriptor_checksum, Key
+from desc_utils import parse_desc_str, append_checksum, descriptor_checksum, Key, MusigKey
 from desc_utils import taproot_tree_helper, fill_policy, Unspend
 from miniscript import Miniscript
 
@@ -231,8 +231,8 @@ class Descriptor:
         if self.tapscript:
             assert len(self.keys) <= MAX_TR_SIGNERS
             assert self.key  # internal key (would fail during parse)
-            if not self.key.is_provably_unspendable:
-                to_check += [self.key]
+        #    if not self.key.is_provably_unspendable:
+        #        to_check += [self.key]
         #else:
         #    assert self.key is None and self.miniscript, "not miniscript"
 
@@ -252,6 +252,9 @@ class Descriptor:
     def storage_policy(self):
         if self.tapscript:
             return self.tapscript.policy
+            
+        if self.taproot:
+            return ""
 
         s = self.miniscript.to_string()
         orig_keys = OrderedDict()
@@ -283,15 +286,12 @@ class Descriptor:
     def xfp_paths(self):
         res = []
         if self.taproot:
-            if self.key.origin:
-                # spendable internal key
-                res.append(self.key.origin.psbt_derivation())
-            elif not isinstance(self.key.node, bytes):
+            if not isinstance(self.key.node, bytes):
                 if self.key.is_provably_unspendable:
                     res.append([swab32(self.key.node.my_fp())])
 
         for k in self.keys:
-            if k.origin:
+            if k.origin and k.derivation:
                 res.append(k.origin.psbt_derivation())
         return res
 
@@ -325,11 +325,16 @@ class Descriptor:
 
     @property
     def keys(self):
+        res = []
+        if self.key and not self.key.is_provably_unspendable:
+            res += [self.key]
+            if isinstance(self.key, MusigKey):
+                res += self.key.aggkeys
         if self.tapscript:
-            return self.tapscript.keys
-        elif self.key:
-            return [self.key]
-        return self.miniscript.keys
+            res += self.tapscript.keys
+        if self.miniscript:
+            res += self.miniscript.keys
+        return res
 
     @property
     def addr_fmt(self):
@@ -406,7 +411,7 @@ class Descriptor:
                 self.key.derive(idx, change=change),
                 self.wpkh,
                 self.taproot,
-                tapscript=self.tapscript.derive(idx, change=change),
+                tapscript=self.tapscript.derive(idx, change=change) if self.tapscript else None,
             )
         if self.miniscript:
             return type(self)(

@@ -17,6 +17,9 @@ PROVABLY_UNSPENDABLE = b'\x02P\x92\x9bt\xc1\xa0IT\xb7\x8bK`5\xe9z^\x07\x8aZ\x0f(
 INPUT_CHARSET = "0123456789()[],'/*abcdefgh@:$%{}IJKLMNOPQRSTUVWXYZ&+-.;<=>?!^_|~ijklmnopqrstuvwxyzABCDEFGH`#\"\\ "
 CHECKSUM_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
 
+SECP256K1_ORDER = int().from_bytes(b"\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xba\xae\xdc\xe6\xaf\x48\xa0\x3b\xbf\xd2\x5e\x8c\xd0\x36\x41\x41", 'big')
+MUSIG_CHAINCODE = b'\x86\x80\x87\xca\x02\xa6\xf9t\xc4Y\x89$\xc3kWv-2\xcbEqqg\xe3\x00b,qg\xe3\x89e'
+
 
 def polymod(c, val):
     c0 = c >> 35
@@ -243,12 +246,13 @@ class KeyDerivationInfo:
 
 
 class Key:
-    def __init__(self, node, origin, derivation=None, taproot=False, chain_type=None):
+    def __init__(self, node, origin, derivation=None, taproot=False, chain_type=None, isAgg=False):
         self.origin = origin
         self.node = node
         self.derivation = derivation
         self.taproot = taproot
         self.chain_type = chain_type
+        self.isAgg = isAgg
 
     def __eq__(self, other):
         return self.origin == other.origin \
@@ -278,6 +282,10 @@ class Key:
         if first == b"u":
             s.seek(-1, 1)
             return Unspend.parse(s)
+            
+        if first == b"m":
+            s.seek(-1, 1)
+            return MusigKey.parse(s)
 
         if first == b"[":
             prefix, char = read_until(s, b"]")
@@ -376,7 +384,7 @@ class Key:
             origin = KeyOriginInfo(fp, [idx])
 
         derivation = KeyDerivationInfo(self.derivation.indexes[1:])
-        return type(self)(new_node, origin, derivation, taproot=self.taproot)
+        return Key(new_node, origin, derivation, taproot=self.taproot, isAgg=self.isAgg)
 
     @classmethod
     def read_from(cls, s, taproot=False):
@@ -413,7 +421,7 @@ class Key:
         kb = self.node
         if not isinstance(kb, bytes):
             kb = self.node.pubkey()
-        if self.taproot:
+        if self.taproot and not self.isAgg:
             if len(kb) == 33:
                 kb = kb[1:]
             assert len(kb) == 32
@@ -438,6 +446,144 @@ class Key:
         s = BytesIO(s.encode())
         return cls.parse(s)
 
+
+class MusigKey(Key):
+    def __init__(self, node=None, origin=None, derivation=None, taproot=True, chain_type=None, aggkeys=None, chain_code=None):
+        assert aggkeys
+        
+        self.aggkeys = aggkeys
+        self.sorted_keys = sorted([arg.key_bytes() for arg in self.aggkeys])
+        if not node:
+            if not chain_code:
+                chain_code = MUSIG_CHAINCODE
+            node = ngu.hdnode.HDNode().from_chaincode_pubkey(chain_code, self.aggregate_key().to_bytes())
+        if not origin:
+            origin = KeyOriginInfo(ustruct.pack('<I', swab32(node.my_fp())), [])
+        super().__init__(node, origin, derivation, taproot, chain_type)
+        assert self.taproot        
+        
+    def __eq__(self, other):
+        if len(self.sorted_keys) != len(other.sorted_keys):
+            return False
+            
+        for i, key in enumerate(self.sorted_keys):
+            if key != other.sorted_keys[i]:
+                return False
+                
+        return True
+     
+    @staticmethod
+    def aggregate_key_coeff(keys, pk):
+        assert pk in keys, "Tried to calculate key coefficient of an unknown key"
+        
+        if (pk == keys[1]):
+            return 1
+            
+        L = ngu.secp256k1.tagged_sha256(b"KeyAgg list", b''.join(keys))
+        return int().from_bytes(ngu.secp256k1.tagged_sha256(b"KeyAgg coefficient", L + pk), 'big') % SECP256K1_ORDER
+         
+    def aggregate_key(self):
+        if len(self.sorted_keys) < 2:
+            raise ValueError("Musig requires at least two keys, got %d" % len(self.sorted_keys))
+        
+        Q = None
+        
+        for i, key in enumerate(self.sorted_keys):
+            P = ngu.secp256k1.pubkey(key).tweak_mul(MusigKey.aggregate_key_coeff(self.sorted_keys, key).to_bytes(32, 'big'))
+            
+            if Q is None:
+                Q = P
+            else:
+                Q = Q.combine(P)
+                
+        assert Q is not None, 'Aggregated Key is None'
+        return Q
+        
+    def derive(self, idx=None, change=False):
+        if self.derivation:
+            der = super().derive(idx, change)
+            return type(self)(node=der.node, origin=der.origin, derivation=der.derivation, taproot=der.taproot, chain_type=der.chain_type, aggkeys=self.aggkeys)
+            
+        derived_keys = [key.derive(idx, change) for key in self.aggkeys]
+        return type(self)(chain_type=derived_keys[0].chain_type, aggkeys=derived_keys)
+        
+    def to_string(self, external=True, internal=True, subderiv=True):
+        string = "musig("
+        for i, key in enumerate(self.aggkeys):
+            if i != 0:
+                string += ","
+            string += key.to_string(external, internal, not self.derivation)
+        string += ")"
+        if self.derivation and subderiv:
+            string += "/cc(" + b2a_hex(self.node.chain_code()).decode() + ")"
+            string += "/" + self.derivation.to_string(external, internal)
+        return string
+        
+    def serialize(self):
+        return self.node.pubkey()[1:]
+        
+    @classmethod
+    def parse(cls, s):
+        prefix, char = read_until(s, b"(")
+        if char != b"(":
+            raise ValueError("Invalid musig - missing (")
+            
+        if prefix != b"musig":
+            raise ValueError("Invalid musig - got %s" % str(prefix))
+            
+        keys = []
+        while char != b")":
+            keys.append(Key.parse(s))
+            keys[-1].isAgg = True
+            assert keys[-1].chain_type == keys[0].chain_type, "Mixing chain types in aggregate key"
+            char = s.read(1)
+            if char not in b",)":
+                raise ValueError("Invalid musig character, expected , or ) - got %s" % char)
+                
+        char = s.read(1)
+        der = None
+        cc = None
+        if char == b"/":
+            char = s.read(1)
+            if char == b"c":
+                prefix, char = read_until(s, b"(")
+                if char != b"(":
+                    raise ValueError("Invalid chaincode in musig derivation - missing (")
+            
+                if prefix != b"c":
+                    raise ValueError("Invalid chaincode in musig derivation - got c%s" % str(prefix))
+                    
+                cc, char = read_until(s, b")")
+                if char != b")":
+                    raise ValueError("Invalid chaincode in musig derivation - missing )")
+                    
+                char = s.read(1)
+                if char != b"/":
+                    raise ValueError("Invalid chaincode in musig derivation - missing /")
+                    
+                cc = a2b_hex(cc)
+            else:
+               s.seek(-1, 1) 
+               
+            der, char = read_until(s, b"<,)")
+            if char == b"<":
+                der += b"<"
+                branch, char = read_until(s, b">")
+                if char is None:
+                    raise ValueError("Failed reading the key, missing >")
+                der += branch + b">"
+                rest, char = read_until(s, b",)")
+                der += rest
+            der = KeyDerivationInfo.from_string(der.decode())
+                
+        if char is not None:
+            s.seek(-1, 1)
+                
+        return cls(derivation=der, chain_type=keys[0].chain_type, aggkeys=keys, chain_code=cc)
+        
+    @property
+    def is_provably_unspendable(self):
+        return False
 
 class Unspend(Key):
     def __init__(self, node, origin=None, derivation=None, taproot=True, chain_type=None):
