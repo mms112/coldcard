@@ -44,12 +44,12 @@ def test_sign1(dev, finalize):
 
 
 @pytest.mark.parametrize('fn', [
-	'data/missing_ins.psbt',
-	'data/missing_txn.psbt',
-	'data/truncated.psbt',
-	'data/unknowns-ins.psbt',
-	'data/unknowns-ins.psbt',
-	'data/dup_keys.psbt',
+    'data/missing_ins.psbt',
+    'data/missing_txn.psbt',
+    'data/truncated.psbt',
+    'data/unknowns-ins.psbt',
+    'data/unknowns-ins.psbt',
+    'data/dup_keys.psbt',
 ])
 def test_psbt_parse_fails(try_sign, fn):
 
@@ -61,19 +61,19 @@ def test_psbt_parse_fails(try_sign, fn):
     assert ('PSBT parse failed' in msg) or ('Invalid PSBT' in msg)
 
 @pytest.mark.parametrize('fn', [
-	'data/2-of-2.psbt',
-	'data/filled_scriptsig.psbt',
-	'data/one-p2pkh-in.psbt',
-	'data/p2pkh+p2sh+outs.psbt',
-	'data/p2pkh-in-scriptsig.psbt',
-	'data/p2pkh-p2sh-p2wpkh.psbt',
-	'data/worked-1.psbt',
-	'data/worked-2.psbt',
-	'data/worked-unsigned.psbt',
-	'data/worked-4.psbt',
-	'data/worked-5.psbt',
-	'data/worked-combined.psbt',
-	'data/worked-7.psbt',
+    'data/2-of-2.psbt',
+    'data/filled_scriptsig.psbt',
+    'data/one-p2pkh-in.psbt',
+    'data/p2pkh+p2sh+outs.psbt',
+    'data/p2pkh-in-scriptsig.psbt',
+    'data/p2pkh-p2sh-p2wpkh.psbt',
+    'data/worked-1.psbt',
+    'data/worked-2.psbt',
+    'data/worked-unsigned.psbt',
+    'data/worked-4.psbt',
+    'data/worked-5.psbt',
+    'data/worked-combined.psbt',
+    'data/worked-7.psbt',
 ])
 @pytest.mark.parametrize('accept', [True, False])
 def test_psbt_parse_good(try_sign, fn, accept):
@@ -105,19 +105,19 @@ def xxx_test_sign_truncated(dev):
 
 
 @pytest.mark.parametrize('fn', [
-	'data/2-of-2.psbt',
-	'data/filled_scriptsig.psbt',
-	'data/one-p2pkh-in.psbt',
-	'data/p2pkh+p2sh+outs.psbt',
-	'data/p2pkh-in-scriptsig.psbt',
-	'data/p2pkh-p2sh-p2wpkh.psbt',
-	'data/worked-1.psbt',
-	'data/worked-2.psbt',
-	'data/worked-unsigned.psbt',
-	'data/worked-4.psbt',
-	'data/worked-5.psbt',
-	'data/worked-combined.psbt',
-	'data/worked-7.psbt',
+    'data/2-of-2.psbt',
+    'data/filled_scriptsig.psbt',
+    'data/one-p2pkh-in.psbt',
+    'data/p2pkh+p2sh+outs.psbt',
+    'data/p2pkh-in-scriptsig.psbt',
+    'data/p2pkh-p2sh-p2wpkh.psbt',
+    'data/worked-1.psbt',
+    'data/worked-2.psbt',
+    'data/worked-unsigned.psbt',
+    'data/worked-4.psbt',
+    'data/worked-5.psbt',
+    'data/worked-combined.psbt',
+    'data/worked-7.psbt',
 ])
 def test_psbt_proxy_parsing(fn, sim_execfile, sim_exec):
     # unit test: parsing by the psbt proxy object
@@ -1892,19 +1892,19 @@ def test_duplicate_unknow_values_in_psbt(dev, start_sign, end_sign, fake_txn):
 
 
 @pytest.fixture
-def _test_single_sig_sighash(microsd_wipe, microsd_path, goto_home, cap_story, press_select,
-                             bitcoind, bitcoind_d_sim_watch, settings_set, finalize_v2_v0_convert,
+def _test_single_sig_sighash(cap_story, press_select, start_sign, end_sign, dev,
+                             bitcoind, bitcoind_d_dev_watch, settings_set, finalize_v2_v0_convert,
                              bitcoind_d_wallet_w_sk):
     def doit(addr_fmt, sighash, num_inputs=2, num_outputs=2, consolidation=False, sh_checks=False,
              psbt_v2=False, tx_check=True):
 
         from decimal import Decimal, ROUND_DOWN
 
-		# supply wallet is legacy wallet (does not support taproot)
+        # supply wallet is legacy wallet (does not support taproot)
         aa = bitcoind_d_wallet_w_sk.getnewaddress()
         bitcoind.supply_wallet.sendtoaddress(address=aa, amount=49)
         bitcoind.supply_wallet.generatetoaddress(1, bitcoind.supply_wallet.getnewaddress())  # mine
-        
+
         if dev.is_simulator:
             # if running against real HW you need to set CC to correct sighshchk mode
             # Below test need to run with sighshchk disabled:
@@ -1918,13 +1918,9 @@ def _test_single_sig_sighash(microsd_wipe, microsd_path, goto_home, cap_story, p
 
             settings_set("sighshchk", int(not sh_checks))
 
-		microsd_wipe()
-        time.sleep(0.1)
-        goto_home()
-
         not_all_ALL = any(sh != "ALL" for sh in sighash)
 
-        bitcoind_d_sim_watch.keypoolrefill(num_inputs + num_outputs)
+        bitcoind_d_dev_watch.keypoolrefill(num_inputs + num_outputs)
         input_val = bitcoind_d_wallet_w_sk.getbalance() / num_inputs
         cc_dest = [
             {bitcoind_d_dev_watch.getnewaddress("", addr_fmt): Decimal(input_val).quantize(Decimal('.0000001'), rounding=ROUND_DOWN)}
@@ -1939,10 +1935,10 @@ def _test_single_sig_sighash(microsd_wipe, microsd_path, goto_home, cap_story, p
         assert len(bitcoind_d_wallet_w_sk.sendrawtransaction(resp["hex"])) == 64
         # mine above txs
         bitcoind_d_wallet_w_sk.generatetoaddress(1, bitcoind_d_wallet_w_sk.getnewaddress())
-        unspent = bitcoind_d_sim_watch.listunspent()
-        output_val = bitcoind_d_sim_watch.getbalance() / num_outputs
+        unspent = bitcoind_d_dev_watch.listunspent()
+        output_val = bitcoind_d_dev_watch.getbalance() / num_outputs
         # consolidation or not?
-        dest_wal = bitcoind_d_sim_watch if consolidation else bitcoind_d_wallet_w_sk
+        dest_wal = bitcoind_d_dev_watch if consolidation else bitcoind_d_wallet_w_sk
         destinations = [
             {dest_wal.getnewaddress("", addr_fmt): Decimal(output_val).quantize(Decimal('.0000001'), rounding=ROUND_DOWN)}
             for _ in range(num_outputs)
@@ -3307,7 +3303,7 @@ def test_invalid_output_tapproot_psbt(fake_txn, start_sign, cap_story, dev):
     # error messages are disabled to save some space - problem file line is still included
     # assert "PSBT_IN_TAP_BIP32_DERIVATION xonly-pubkey length != 32" in story
 
-    
+
 def test_low_R_grinding(dev, goto_home, microsd_path, press_select, offer_ms_import,
                         cap_story, try_sign, reset_seed_words, clear_ms):
     reset_seed_words()

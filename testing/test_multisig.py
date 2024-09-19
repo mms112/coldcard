@@ -6,10 +6,7 @@
 #
 #       py.test test_multisig.py -m ms_danger --ms-danger
 #
-import sys
-sys.path.append("../shared")
-from descriptor import MultisigDescriptor, append_checksum, MULTI_FMT_TO_SCRIPT, parse_desc_str
-import time, pytest, os, random, json, shutil, pdb, io, base64, struct, bech32, itertools, re
+import time, pytest, os, random, json, shutil, pdb, io, base64, struct, bech32
 from psbt import BasicPSBT, BasicPSBTInput, BasicPSBTOutput
 from ckcc.protocol import CCProtocolPacker, MAX_TXN_LEN
 from pprint import pprint
@@ -165,20 +162,66 @@ def offer_ms_import(cap_story, dev):
     return doit
 
 @pytest.fixture
-def import_multisig(request, is_q1, need_keypress, offer_ms_import):
-    def doit(fname=None, way="sd", data=None, name=None):
-        assert fname or data
-        if fname:
-            if way == "sd":
-                microsd_path = request.getfixturevalue("microsd_path")
-                fpath = microsd_path(fname)
+def import_ms_wallet(dev, make_multisig, offer_ms_import, press_select,
+                     is_q1, request, need_keypress, settings_set):
+
+    def doit(M, N, addr_fmt=None, name=None, unique=0, accept=False, common=None,
+             keys=None, do_import=True, derivs=None, descriptor=False,
+             int_ext_desc=False, dev_key=False, way=None, bip67=True, chain="XTN", force_unsort_ms=True):
+             
+        # param: bip67 if false, only usable together with descriptor=True
+        if not bip67:
+            assert descriptor, "needs descriptor=True"
+
+        if (not bip67) and force_unsort_ms:
+            settings_set("unsort_ms", 1)
+            
+        keys = keys or make_multisig(M, N, unique=unique, dev_key=dev_key,
+                                     deriv=common or (derivs[0] if derivs else None),
+                                     chain=chain)
+        name = name or f'test-{M}-{N}'
+
+        if not do_import:
+            return keys
+
+        if descriptor:
+            if not derivs:
+                if not common:
+                    common = "m/45h"
+                key_list = [(xfp, common, dd.hwif(as_private=False)) for xfp, m, dd in keys]
             else:
-                virtdisk_path = request.getfixturevalue("virtdisk_path")
-                fpath = virtdisk_path(fname)
-            with open(fpath, 'r') as f:
-                config = f.read()
+                assert len(derivs) == N
+                key_list = [(xfp, derivs[idx], dd.hwif(as_private=False)) for idx, (xfp, m, dd) in enumerate(keys)]
+            desc = MultisigDescriptor(M=M, N=N, keys=key_list, addr_fmt=addr_fmt, is_sorted=bip67)
+            if int_ext_desc:
+                desc_str = desc.serialize(int_ext=True)
+            else:
+                desc_str = desc.serialize()
+            config = "%s\n" % desc_str
         else:
-            config = data
+            # render as a file for import
+            config = f"name: {name}\npolicy: {M} / {N}\n\n"
+
+            if addr_fmt:
+                config += f'format: {addr_fmt.title()}\n'
+
+            # not good enuf anymore, but maybe in some cases, just need one at top
+            if common:
+                config += f'derivation: {common}\n'
+
+            if not derivs:
+                config += '\n'.join('%s: %s' % (xfp2str(xfp), dd.hwif(as_private=False))
+                                                for xfp, m, dd in keys)
+            else:
+                # for cases where derivation of each leg is not same/simple
+                assert not common and len(derivs) == N
+                for idx, (xfp, m, dd) in enumerate(keys):
+                    config += 'Derivation: %s\n%s: %s\n\n' % (derivs[idx],
+                                            xfp2str(xfp), dd.hwif(as_private=False))
+
+        #print(config)
+        open('debug/last-ms.txt', 'wt').write(config)
+
         if way is None:  # USB
             title, story = offer_ms_import(config)
         else:
@@ -247,74 +290,6 @@ def import_multisig(request, is_q1, need_keypress, offer_ms_import):
 
             time.sleep(.1)
             title, story = cap_story()
-        return title, story
-
-    return doit
-
-@pytest.fixture
-def import_ms_wallet(dev, make_multisig, offer_ms_import, press_select,
-                     is_q1, request, need_keypress, import_multisig,
-                     settings_set):
-
-    def doit(M, N, addr_fmt=None, name=None, unique=0, accept=False, common=None,
-             keys=None, do_import=True, derivs=None, descriptor=False,
-             int_ext_desc=False, dev_key=False, way=None, bip67=True,
-             force_unsort_ms=True):
-        # param: bip67 if false, only usable together with descriptor=True
-        if not bip67:
-            assert descriptor, "needs descriptor=True"
-
-        if (not bip67) and force_unsort_ms:
-            settings_set("unsort_ms", 1)
-
-        keys = keys or make_multisig(M, N, unique=unique, dev_key=dev_key,
-                                     deriv=common or (derivs[0] if derivs else None))
-        name = name or f'test-{M}-{N}'
-
-        if not do_import:
-            return keys
-
-        if descriptor:
-            if not derivs:
-                if not common:
-                    common = "m/45h"
-                key_list = [(xfp, common, dd.hwif(as_private=False)) for xfp, m, dd in keys]
-            else:
-                assert len(derivs) == N
-                key_list = [(xfp, derivs[idx], dd.hwif(as_private=False)) for idx, (xfp, m, dd) in enumerate(keys)]
-            desc = MultisigDescriptor(M=M, N=N, keys=key_list, addr_fmt=addr_fmt, is_sorted=bip67)
-            if int_ext_desc:
-                desc_str = desc.serialize(int_ext=True)
-            else:
-                desc_str = desc.serialize()
-            config = "%s\n" % desc_str
-        else:
-            # render as a file for import
-            config = f"name: {name}\npolicy: {M} / {N}\n\n"
-
-            if addr_fmt:
-                if isinstance(addr_fmt, int):
-                    addr_fmt = addr_fmt_names[addr_fmt]
-                config += f'format: {addr_fmt.title()}\n'
-
-            # not good enuf anymore, but maybe in some cases, just need one at top
-            if common:
-                config += f'derivation: {common}\n'
-
-            if not derivs:
-                config += '\n'.join('%s: %s' % (xfp2str(xfp), dd.hwif(as_private=False))
-                                                for xfp, m, dd in keys)
-            else:
-                # for cases where derivation of each leg is not same/simple
-                assert not common and len(derivs) == N
-                for idx, (xfp, m, dd) in enumerate(keys):
-                    config += 'Derivation: %s\n%s: %s\n\n' % (derivs[idx],
-                                            xfp2str(xfp), dd.hwif(as_private=False))
-
-        #print(config)
-        open('debug/last-ms.txt', 'wt').write(config)
-
-        title, story = import_multisig(data=config, way=way)
 
         assert 'Create new multisig' in story \
                 or 'Update existing multisig wallet' in story \
@@ -2395,128 +2370,6 @@ def test_bitcoind_ms_address(change, M_N, addr_fmt, clear_ms, goto_home, need_ke
         assert bitcoind_addrs[idx] == address
 
 
-@pytest.fixture
-def bitcoind_multisig(bitcoind, bitcoind_d_sim_watch, need_keypress, cap_story, load_export, pick_menu_item, goto_home,
-                      cap_menu, microsd_path, use_regtest, press_select):
-    def doit(M, N, script_type, cc_account=0, funded=True):
-        use_regtest()
-        bitcoind_signers = [
-            bitcoind.create_wallet(wallet_name=f"bitcoind--signer{i}", disable_private_keys=False, blank=False,
-                                   passphrase=None, avoid_reuse=False, descriptors=True)
-            for i in range(N - 1)
-        ]
-        for signer in bitcoind_signers:
-            signer.keypoolrefill(10)
-        # watch only wallet where multisig descriptor will be imported
-        ms = bitcoind.create_wallet(
-            wallet_name=f"watch_only_{script_type}_{M}of{N}", disable_private_keys=True,
-            blank=True, passphrase=None, avoid_reuse=False, descriptors=True
-        )
-        goto_home()
-        pick_menu_item('Settings')
-        pick_menu_item('Multisig Wallets')
-        pick_menu_item('Export XPUB')
-        time.sleep(0.5)
-        title, story = cap_story()
-        assert "extended public keys (XPUB) you would need to join a multisig wallet" in story
-        press_select()
-        need_keypress(str(cc_account))  # account
-        press_select()
-        xpub_obj = load_export("sd", label="Multisig XPUB", is_json=True, sig_check=False)
-        template = xpub_obj[script_type +"_desc"]
-        # get keys from bitcoind signers
-        bitcoind_signers_xpubs = []
-        for signer in bitcoind_signers:
-            target_desc = ""
-            bitcoind_descriptors = signer.listdescriptors()["descriptors"]
-            for desc in bitcoind_descriptors:
-                if desc["desc"].startswith("pkh(") and desc["internal"] is False:
-                    target_desc = desc["desc"]
-            core_desc, checksum = target_desc.split("#")
-            # remove pkh(....)
-            core_key = core_desc[4:-1]
-            bitcoind_signers_xpubs.append(core_key)
-        desc = template.replace("M", str(M), 1).replace("...", ",".join(bitcoind_signers_xpubs))
-
-        if script_type == 'p2wsh':
-            name = f"core{M}of{N}_native.txt"
-        elif script_type == "p2sh_p2wsh":
-            name = f"core{M}of{N}_wrapped.txt"
-        else:
-            name = f"core{M}of{N}_legacy.txt"
-        with open(microsd_path(name), "w") as f:
-            f.write(desc + "\n")
-        goto_home()
-        pick_menu_item('Settings')
-        pick_menu_item('Multisig Wallets')
-        pick_menu_item('Import from File')
-        time.sleep(0.3)
-        _, story = cap_story()
-        if "Press (1) to import multisig wallet file from SD Card" in story:
-            # in case Vdisk is enabled
-            need_keypress("1")
-        time.sleep(0.5)
-        pick_menu_item(name)
-        _, story = cap_story()
-        assert "Create new multisig wallet?" in story
-        assert name.split(".")[0] in story
-        assert f"{M} of {N}" in story
-        if M == N:
-            assert f"All {N} co-signers must approve spends" in story
-        else:
-            assert f"{M} signatures, from {N} possible" in story
-        if script_type == "p2wsh":
-            assert "P2WSH" in story
-        elif script_type == "p2sh":
-            assert "P2SH" in story
-        else:
-            assert "P2SH-P2WSH" in story
-        assert "Derivation:\n  Varies (2)" in story
-        press_select()  # approve multisig import
-        goto_home()
-        pick_menu_item('Settings')
-        pick_menu_item('Multisig Wallets')
-        menu = cap_menu()
-        pick_menu_item(menu[0])  # pick imported descriptor multisig wallet
-        pick_menu_item("Descriptors")
-        pick_menu_item("Bitcoin Core")
-        text = load_export("sd", label="Bitcoin Core multisig setup", is_json=False, sig_check=False)
-        text = text.replace("importdescriptors ", "").strip()
-        # remove junk
-        r1 = text.find("[")
-        r2 = text.find("]", -1, 0)
-        text = text[r1: r2]
-        core_desc_object = json.loads(text)
-        # import descriptors to watch only wallet
-        res = ms.importdescriptors(core_desc_object)
-        assert res[0]["success"]
-        assert res[1]["success"]
-
-        if funded:
-            if script_type == "p2wsh":
-                addr_type = "bech32"
-            elif script_type == "p2tr":
-                addr_type = "bech32m"
-            elif script_type == "p2sh":
-                addr_type = "legacy"
-            else:
-                addr_type = "p2sh-segwit"
-
-            addr = ms.getnewaddress("", addr_type)
-            if script_type == "p2wsh":
-                sw = "bcrt1q"
-            elif script_type == "p2tr":
-                sw = "bcrt1p"
-            else:
-                sw = "2"
-            assert addr.startswith(sw)
-            # get some coins and fund above multisig address
-            bitcoind.supply_wallet.sendtoaddress(addr, 49)
-            bitcoind.supply_wallet.generatetoaddress(1, bitcoind.supply_wallet.getnewaddress())  # mine above
-
-        return ms, bitcoind_signers
-
-    return doit
 
 
 @pytest.mark.bitcoind
@@ -2631,7 +2484,7 @@ def test_legacy_multisig_witness_utxo_in_psbt(bitcoind, use_regtest, clear_ms, m
 
 @pytest.mark.bitcoind
 @pytest.mark.parametrize("m_n", [(2,2), (3, 5), (15, 15)])
-@pytest.mark.parametrize("script_type", ["p2wsh", "p2sh_p2wsh", "p2sh"])
+@pytest.mark.parametrize("desc_type", ["p2wsh_desc", "p2sh_p2wsh_desc", "p2sh_desc"])
 @pytest.mark.parametrize("sighash", list(SIGHASH_MAP.keys()))
 @pytest.mark.parametrize("psbt_v2", [True, False])
 @pytest.mark.parametrize('desc', ["multi", "sortedmulti"])
@@ -2750,16 +2603,23 @@ def test_bitcoind_MofN_tutorial(m_n, desc_type, clear_ms, goto_home, need_keypre
         assert obj["success"], obj
     if desc_type == "p2wsh_desc":
         addr_type = "bech32"
-    elif script_type == "p2sh":
+    elif desc_type == "p2sh_desc":
         addr_type = "legacy"
     else:
         addr_type = "p2sh-segwit"
-
+    multi_addr = bitcoind_watch_only.getnewaddress("", addr_type)
+    dest_addr = bitcoind_watch_only.getnewaddress("", addr_type)
+    if desc_type == "p2wsh_desc":
+        assert all([addr.startswith("bcrt1q") for addr in [multi_addr, dest_addr]])
+    else:
+        assert all([addr.startswith("2") for addr in [multi_addr, dest_addr]])
+    # mine some coins and fund above multisig address
+    mined = bitcoind_watch_only.generatetoaddress(101, multi_addr)
+    assert isinstance(mined, list) and len(mined) == 101
     # create funded PSBT
     all_of_it = bitcoind_watch_only.getbalance()
-    dest_addr = bitcoind_watch_only.getnewaddress("", addr_type)
     psbt_resp = bitcoind_watch_only.walletcreatefundedpsbt(
-        [], [{dest_addr: all_of_it - 1}], 0, {"fee_rate": 20, "change_type": addr_type,
+        [], [{dest_addr: all_of_it}], 0, {"fee_rate": 20, "change_type": addr_type,
                                           "subtractFeeFromOutputs": [0]}
     )
     psbt = psbt_resp.get("psbt")
@@ -2778,7 +2638,7 @@ def test_bitcoind_MofN_tutorial(m_n, desc_type, clear_ms, goto_home, need_keypre
         po.to_v2()
         psbt = po.as_b64_str()
 
-    name = f"hsc_{M}of{N}_{script_type}.psbt"
+    name = f"hsc_{M}of{N}_{desc_type}.psbt"
     with open(microsd_path(name), "w") as f:
         f.write(psbt)
     goto_home()
@@ -2821,7 +2681,10 @@ def test_bitcoind_MofN_tutorial(m_n, desc_type, clear_ms, goto_home, need_keypre
     res = bitcoind_watch_only.sendrawtransaction(tx_hex)
     assert len(res) == 64  # tx id
 
+    #  try to sign change - do a consolidation transaction which spends all inputs
+    addr_a = bitcoind_watch_only.getnewaddress("", addr_type)
     consolidate = bitcoind_watch_only.getnewaddress("", addr_type)
+    bitcoind_watch_only.generatetoaddress(1, addr_a)  # need to mine above tx
     balance = bitcoind_watch_only.getbalance()
     unspent = bitcoind_watch_only.listunspent()
     psbt_outs = [{consolidate: balance}]
@@ -2832,7 +2695,7 @@ def test_bitcoind_MofN_tutorial(m_n, desc_type, clear_ms, goto_home, need_keypre
     for idx, i in enumerate(x.inputs):
         i.sighash = SIGHASH_MAP[sighash]
     psbt = x.as_b64_str()
-    name = f"change_{M}of{N}_{script_type}.psbt"
+    name = f"change_{M}of{N}_{desc_type}.psbt"
     with open(microsd_path(name), "w") as f:
         f.write(psbt)
     goto_home()
@@ -2878,7 +2741,7 @@ def test_bitcoind_MofN_tutorial(m_n, desc_type, clear_ms, goto_home, need_keypre
     res = bitcoind_watch_only.sendrawtransaction(tx_hex)
     assert len(res) == 64  # tx id
     bitcoind_signers[0].generatetoaddress(1, bitcoind_signers[0].getnewaddress())  # mine block
-    assert len(bitcoind_watch_only.listunspent()) == 1
+    assert len(bitcoind_watch_only.listunspent()) == 2  # (merged all inputs to one + one newly spendable from mining)
 
 
 @pytest.mark.parametrize("desc", [
