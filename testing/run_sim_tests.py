@@ -278,7 +278,7 @@ def main():
 
         print("Started", test_module)
         if test_module in ["test_bsms.py", "test_address_explorer.py", "test_export.py",
-                           "test_multisig.py", "test_ux.py"]:
+                           "test_multisig.py", "test_ux.py", "test_miniscript.py", "test_bsms.py"]:
             test_args = DEFAULT_SIMULATOR_ARGS + ["--set", "vidsk=1"]
         if test_module == "test_vdisk.py":
             test_args = ["--eject"] + DEFAULT_SIMULATOR_ARGS + ["--set", "vidsk=1"]

@@ -3,7 +3,7 @@
 # Miniscript-related tests.
 #
 import pytest, json, time, itertools, struct, random, os
-from ckcc.protocol import CCProtocolPacker
+from ckcc_protocol.protocol import CCProtocolPacker
 from constants import AF_P2TR
 from psbt import BasicPSBT
 from charcodes import KEY_QR, KEY_RIGHT, KEY_CANCEL

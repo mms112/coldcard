@@ -6,7 +6,7 @@
 #
 #       py.test test_multisig.py -m ms_danger --ms-danger
 #
-import time, pytest, os, random, json, shutil, pdb, io, base64, struct, bech32
+import time, pytest, os, random, json, shutil, pdb, io, base64, struct, bech32, itertools, re
 from psbt import BasicPSBT, BasicPSBTInput, BasicPSBTOutput
 from ckcc.protocol import CCProtocolPacker, MAX_TXN_LEN
 from pprint import pprint
@@ -162,66 +162,20 @@ def offer_ms_import(cap_story, dev):
     return doit
 
 @pytest.fixture
-def import_ms_wallet(dev, make_multisig, offer_ms_import, press_select,
-                     is_q1, request, need_keypress, settings_set):
-
-    def doit(M, N, addr_fmt=None, name=None, unique=0, accept=False, common=None,
-             keys=None, do_import=True, derivs=None, descriptor=False,
-             int_ext_desc=False, dev_key=False, way=None, bip67=True, chain="XTN", force_unsort_ms=True):
-             
-        # param: bip67 if false, only usable together with descriptor=True
-        if not bip67:
-            assert descriptor, "needs descriptor=True"
-
-        if (not bip67) and force_unsort_ms:
-            settings_set("unsort_ms", 1)
-            
-        keys = keys or make_multisig(M, N, unique=unique, dev_key=dev_key,
-                                     deriv=common or (derivs[0] if derivs else None),
-                                     chain=chain)
-        name = name or f'test-{M}-{N}'
-
-        if not do_import:
-            return keys
-
-        if descriptor:
-            if not derivs:
-                if not common:
-                    common = "m/45h"
-                key_list = [(xfp, common, dd.hwif(as_private=False)) for xfp, m, dd in keys]
+def import_multisig(request, is_q1, need_keypress, offer_ms_import):
+    def doit(fname=None, way="sd", data=None, name=None):
+        assert fname or data
+        if fname:
+            if way == "sd":
+                microsd_path = request.getfixturevalue("microsd_path")
+                fpath = microsd_path(fname)
             else:
-                assert len(derivs) == N
-                key_list = [(xfp, derivs[idx], dd.hwif(as_private=False)) for idx, (xfp, m, dd) in enumerate(keys)]
-            desc = MultisigDescriptor(M=M, N=N, keys=key_list, addr_fmt=addr_fmt, is_sorted=bip67)
-            if int_ext_desc:
-                desc_str = desc.serialize(int_ext=True)
-            else:
-                desc_str = desc.serialize()
-            config = "%s\n" % desc_str
+                virtdisk_path = request.getfixturevalue("virtdisk_path")
+                fpath = virtdisk_path(fname)
+            with open(fpath, 'r') as f:
+                config = f.read()
         else:
-            # render as a file for import
-            config = f"name: {name}\npolicy: {M} / {N}\n\n"
-
-            if addr_fmt:
-                config += f'format: {addr_fmt.title()}\n'
-
-            # not good enuf anymore, but maybe in some cases, just need one at top
-            if common:
-                config += f'derivation: {common}\n'
-
-            if not derivs:
-                config += '\n'.join('%s: %s' % (xfp2str(xfp), dd.hwif(as_private=False))
-                                                for xfp, m, dd in keys)
-            else:
-                # for cases where derivation of each leg is not same/simple
-                assert not common and len(derivs) == N
-                for idx, (xfp, m, dd) in enumerate(keys):
-                    config += 'Derivation: %s\n%s: %s\n\n' % (derivs[idx],
-                                            xfp2str(xfp), dd.hwif(as_private=False))
-
-        #print(config)
-        open('debug/last-ms.txt', 'wt').write(config)
-
+            config = data
         if way is None:  # USB
             title, story = offer_ms_import(config)
         else:
@@ -290,6 +244,73 @@ def import_ms_wallet(dev, make_multisig, offer_ms_import, press_select,
 
             time.sleep(.1)
             title, story = cap_story()
+        return title, story
+
+    return doit
+
+@pytest.fixture
+def import_ms_wallet(dev, make_multisig, offer_ms_import, press_select,
+                     is_q1, request, need_keypress, import_multisig,
+                     settings_set):
+
+    def doit(M, N, addr_fmt=None, name=None, unique=0, accept=False, common=None,
+             keys=None, do_import=True, derivs=None, descriptor=False,
+             int_ext_desc=False, dev_key=False, way=None, bip67=True, chain="XTN",
+             force_unsort_ms=True):
+        # param: bip67 if false, only usable together with descriptor=True
+        if not bip67:
+            assert descriptor, "needs descriptor=True"
+
+        if (not bip67) and force_unsort_ms:
+            settings_set("unsort_ms", 1)
+
+        keys = keys or make_multisig(M, N, unique=unique, dev_key=dev_key,
+                                     deriv=common or (derivs[0] if derivs else None),
+                                     chain=chain)
+        name = name or f'test-{M}-{N}'
+
+        if not do_import:
+            return keys
+
+        if descriptor:
+            if not derivs:
+                if not common:
+                    common = "m/45h"
+                key_list = [(xfp, common, dd.hwif(as_private=False)) for xfp, m, dd in keys]
+            else:
+                assert len(derivs) == N
+                key_list = [(xfp, derivs[idx], dd.hwif(as_private=False)) for idx, (xfp, m, dd) in enumerate(keys)]
+            desc = MultisigDescriptor(M=M, N=N, keys=key_list, addr_fmt=unmap_addr_fmt.get(addr_fmt, addr_fmt), is_sorted=bip67)
+            if int_ext_desc:
+                desc_str = desc.serialize(int_ext=True)
+            else:
+                desc_str = desc.serialize()
+            config = "%s\n" % desc_str
+        else:
+            # render as a file for import
+            config = f"name: {name}\npolicy: {M} / {N}\n\n"
+
+            if addr_fmt:
+                config += f'format: {addr_fmt_names.get(addr_fmt, addr_fmt)}\n'
+
+            # not good enough anymore, but maybe in some cases, just need one at top
+            if common:
+                config += f'derivation: {common}\n'
+
+            if not derivs:
+                config += '\n'.join('%s: %s' % (xfp2str(xfp), dd.hwif(as_private=False))
+                                                for xfp, m, dd in keys)
+            else:
+                # for cases where derivation of each leg is not same/simple
+                assert not common and len(derivs) == N
+                for idx, (xfp, m, dd) in enumerate(keys):
+                    config += 'Derivation: %s\n%s: %s\n\n' % (derivs[idx],
+                                            xfp2str(xfp), dd.hwif(as_private=False))
+
+        #print(config)
+        open('debug/last-ms.txt', 'wt').write(config)
+
+        title, story = import_multisig(data=config, way=way)
 
         assert 'Create new multisig' in story \
                 or 'Update existing multisig wallet' in story \
@@ -566,6 +587,7 @@ def test_violate_bip67(clear_ms, use_regtest, import_ms_wallet,
     assert 'BIP-67' in e.value.args[0]
 
 
+@pytest.mark.bitcoind
 @pytest.mark.parametrize("has_change", [True, False])
 def test_violate_import_order_multi(has_change, clear_ms, import_ms_wallet,
                                     fake_ms_txn, try_sign, test_ms_show_addr):
@@ -706,6 +728,7 @@ def test_import_detail(desc, clear_ms, import_ms_wallet, need_keypress,
     # check all details are shown right
 
     M,N = 14, 15
+    clear_ms()
     descriptor, bip67 = (True, False) if desc == "multi" else (False, True)
     keys = import_ms_wallet(M, N, descriptor=descriptor, bip67=bip67)
 
@@ -812,9 +835,10 @@ def test_export_airgap(acct_num, goto_home, cap_story, pick_menu_item, cap_menu,
 @pytest.mark.parametrize('vdisk', [True, False])
 def test_import_ux(N, vdisk, goto_home, cap_story, pick_menu_item,
                    need_keypress, microsd_path, make_multisig,
-                   virtdisk_path, is_q1, press_cancel, press_select):
+                   virtdisk_path, is_q1, press_cancel, press_select, clear_ms):
     # test menu-based UX for importing wallet file from SD
     M = N-1
+    clear_ms()
 
     keys = make_multisig(M, N)
     name = 'named-%d' % random.randint(10000,99999)
@@ -1478,6 +1502,8 @@ def test_ms_sign_myself(M, use_regtest, make_myself_wallet, segwit, num_ins, dev
     open(f'debug/myself-before.psbt', 'w').write(b64encode(psbt).decode())
     for idx in range(M):
         select_wallet(idx)
+        if incl_xpubs:
+            clear_ms()
         _, updated = try_sign(psbt, accept_ms_import=incl_xpubs)
         open(f'debug/myself-after.psbt', 'w').write(b64encode(updated).decode())
         assert updated != psbt
@@ -1654,10 +1680,13 @@ def test_make_airgapped(addr_fmt, acct_num, M_N, goto_home, cap_story, pick_menu
     if incl_self is not False:
         assert "Create new multisig" in story
         press_select()
+        press_cancel() # cancel export
+        press_cancel() # cancel export
         # we use clear_ms fixture at the begining of each test
         # new multisig wallet is first menu item
         press_select()
         pick_menu_item("Coldcard Export")
+        need_keypress('1')
         impf, fname = load_export("sd", label="Coldcard multisig setup", is_json=False,
                                   sig_check=False, ret_fname=True)
         cc_fname = microsd_path(fname)
@@ -1927,13 +1956,14 @@ def test_ms_sign_bitrot(num_ins, dev, addr_fmt, clear_ms, incl_xpubs, import_ms_
 @pytest.mark.parametrize('pk_num', range(4)) 
 @pytest.mark.parametrize('case', ['pubkey', 'path'])
 def test_ms_change_fraud(case, pk_num, num_ins, dev, addr_fmt, clear_ms, incl_xpubs, make_multisig,
-                         addr_vs_path, fake_ms_txn, start_sign, end_sign, out_style, cap_story):
+                         addr_vs_path, fake_ms_txn, start_sign, end_sign, out_style, cap_story, settings_set):
     
     M = 1
     N = 3
     num_outs = 2
 
     clear_ms()
+    settings_set('pms', 1)
     keys = make_multisig(M, N)
 
 
@@ -1966,7 +1996,7 @@ def test_ms_change_fraud(case, pk_num, num_ins, dev, addr_fmt, clear_ms, incl_xp
 
     with pytest.raises(Exception) as ee:
         start_sign(psbt)
-        signed = end_sign(accept=True, accept_ms_import=False)
+        signed = end_sign(accept=None, accept_ms_import=True)
     assert 'Output#0:' in str(ee)
     assert 'P2WSH or P2SH change output script' in str(ee)
     #assert 'Deception regarding change output' in str(ee)
@@ -1977,6 +2007,43 @@ def test_ms_change_fraud(case, pk_num, num_ins, dev, addr_fmt, clear_ms, incl_xp
     assert story.strip() in str(ee.value.args[0])
     assert len(story.split(':')[-1].strip()), story
 
+
+@pytest.mark.parametrize('repeat', range(2) )
+def test_iss6743(repeat, set_seed_words, sim_execfile, try_sign):
+    # from SomberNight <https://github.com/spesmilo/electrum/issues/6743#issuecomment-729965813>
+    psbt_b4 = bytes.fromhex('70736274ff0100520200000001bde05be36069e2e0fe44793c68ad8244bb1a52cc37f152e0fa5b75e40169d7f70000000000fdffffff018b1e000000000000160014ed5180f05c7b1dc980732602c50cda40530e00ad4de11c004f01024289ef0000000000000000007dd565da7ee1cf05c516e89a608968fed4a2450633a00c7b922df66b27afd2e1033a0a4fa4b0a997738ac2f142a395c1f02afcb31d7ffd46a90a0c927a4c411fd704094ef7844f01024289ef0431fcbdcc8000000112d4aaea7292e7870c7eeb3565fa1c1fa8f957fa7c4c24b411d5b4f5710d359a023e63d1e54063525bea286ccb2a0ad7b14560aa31ec4be826afa883141dfe1d53145c9e228d300000800100008000000080010000804f01024289ef04e44b38f1800000014a1960f3a3c86ba355a16a66a548cfb62eeb25663311f7cd662a192896f3777e038cc595159a395e4ec35e477c9523a1512f873e74d303fb03fc9a1503b1ba45271434652fae30000080010000800000008001000080000100df02000000000101d1a321707660769c7f8604d04c9ae2db58cf1ec7a01f4f285cdcbb25ce14bdfd0300000000fdffffff02401f00000000000017a914bfd0b8471a3706c1e17870a4d39b0354bcea57b687c864000000000000160014e608b171d63ec24d9fa252d5c1e45624b14e44700247304402205133eb96df167b895f657cce31c6882840a403013682d9d4651aed2730a7dad502202aaacc045d85d9c711af0c84e7f355cc18bf2f8e6d91774d42ba24de8418a39e012103a58d8eb325abb412eaf927cf11d8b7641c4a468ce412057e47892ca2d13ed6144de11c000104220020a3c65c4e376d82fb3ca45596feee5b08313ad64f38590c1b08bc530d1c0bbfea010569522102ab84641359fa22461b8461515231da63c196614cd22b26e556ed878e30db4da621034211ab0f75c3a307a2f6bf6f09a9e05d3c8edd0ba7a2ac31f432d1045ef6381921039690cf74941da5db291fa8be7348abe3807786732d969eac5d27e0afa909a55f53ae220602ab84641359fa22461b8461515231da63c196614cd22b26e556ed878e30db4da60c094ef78400000000030000002206034211ab0f75c3a307a2f6bf6f09a9e05d3c8edd0ba7a2ac31f432d1045ef638191c5c9e228d3000008001000080000000800100008000000000030000002206039690cf74941da5db291fa8be7348abe3807786732d969eac5d27e0afa909a55f1c34652fae3000008001000080000000800100008000000000030000000000')
+    # pre 3.2.0 result
+    psbt_wrong = bytes.fromhex('70736274ff0100520200000001bde05be36069e2e0fe44793c68ad8244bb1a52cc37f152e0fa5b75e40169d7f70000000000fdffffff018b1e000000000000160014ed5180f05c7b1dc980732602c50cda40530e00ad4de11c004f01024289ef0000000000000000007dd565da7ee1cf05c516e89a608968fed4a2450633a00c7b922df66b27afd2e1033a0a4fa4b0a997738ac2f142a395c1f02afcb31d7ffd46a90a0c927a4c411fd704094ef7844f01024289ef0431fcbdcc8000000112d4aaea7292e7870c7eeb3565fa1c1fa8f957fa7c4c24b411d5b4f5710d359a023e63d1e54063525bea286ccb2a0ad7b14560aa31ec4be826afa883141dfe1d53145c9e228d300000800100008000000080010000804f01024289ef04e44b38f1800000014a1960f3a3c86ba355a16a66a548cfb62eeb25663311f7cd662a192896f3777e038cc595159a395e4ec35e477c9523a1512f873e74d303fb03fc9a1503b1ba45271434652fae30000080010000800000008001000080000100df02000000000101d1a321707660769c7f8604d04c9ae2db58cf1ec7a01f4f285cdcbb25ce14bdfd0300000000fdffffff02401f00000000000017a914bfd0b8471a3706c1e17870a4d39b0354bcea57b687c864000000000000160014e608b171d63ec24d9fa252d5c1e45624b14e44700247304402205133eb96df167b895f657cce31c6882840a403013682d9d4651aed2730a7dad502202aaacc045d85d9c711af0c84e7f355cc18bf2f8e6d91774d42ba24de8418a39e012103a58d8eb325abb412eaf927cf11d8b7641c4a468ce412057e47892ca2d13ed6144de11c002202034211ab0f75c3a307a2f6bf6f09a9e05d3c8edd0ba7a2ac31f432d1045ef63819483045022100a85d08eef6675803fe2b58dda11a553641080e07da36a2f3e116f1224201931b022071b0ba83ef920d49b520c37993c039d13ae508a1adbd47eb4b329713fcc8baef01010304010000002206034211ab0f75c3a307a2f6bf6f09a9e05d3c8edd0ba7a2ac31f432d1045ef638191c5c9e228d3000008001000080000000800100008000000000030000002206039690cf74941da5db291fa8be7348abe3807786732d969eac5d27e0afa909a55f1c34652fae300000800100008000000080010000800000000003000000220602ab84641359fa22461b8461515231da63c196614cd22b26e556ed878e30db4da60c094ef78400000000030000000104220020a3c65c4e376d82fb3ca45596feee5b08313ad64f38590c1b08bc530d1c0bbfea010569522102ab84641359fa22461b8461515231da63c196614cd22b26e556ed878e30db4da621034211ab0f75c3a307a2f6bf6f09a9e05d3c8edd0ba7a2ac31f432d1045ef6381921039690cf74941da5db291fa8be7348abe3807786732d969eac5d27e0afa909a55f53ae0000')
+    # psbt_right = bytes.fromhex('70736274ff0100520200000001bde05be36069e2e0fe44793c68ad8244bb1a52cc37f152e0fa5b75e40169d7f70000000000fdffffff018b1e000000000000160014ed5180f05c7b1dc980732602c50cda40530e00ad4de11c004f01024289ef0000000000000000007dd565da7ee1cf05c516e89a608968fed4a2450633a00c7b922df66b27afd2e1033a0a4fa4b0a997738ac2f142a395c1f02afcb31d7ffd46a90a0c927a4c411fd704094ef7844f01024289ef0431fcbdcc8000000112d4aaea7292e7870c7eeb3565fa1c1fa8f957fa7c4c24b411d5b4f5710d359a023e63d1e54063525bea286ccb2a0ad7b14560aa31ec4be826afa883141dfe1d53145c9e228d300000800100008000000080010000804f01024289ef04e44b38f1800000014a1960f3a3c86ba355a16a66a548cfb62eeb25663311f7cd662a192896f3777e038cc595159a395e4ec35e477c9523a1512f873e74d303fb03fc9a1503b1ba45271434652fae30000080010000800000008001000080000100df02000000000101d1a321707660769c7f8604d04c9ae2db58cf1ec7a01f4f285cdcbb25ce14bdfd0300000000fdffffff02401f00000000000017a914bfd0b8471a3706c1e17870a4d39b0354bcea57b687c864000000000000160014e608b171d63ec24d9fa252d5c1e45624b14e44700247304402205133eb96df167b895f657cce31c6882840a403013682d9d4651aed2730a7dad502202aaacc045d85d9c711af0c84e7f355cc18bf2f8e6d91774d42ba24de8418a39e012103a58d8eb325abb412eaf927cf11d8b7641c4a468ce412057e47892ca2d13ed6144de11c002202034211ab0f75c3a307a2f6bf6f09a9e05d3c8edd0ba7a2ac31f432d1045ef63819483045022100ae90a7e4c350389816b03af0af46df59a2f53da04cc95a2abd81c0bbc5950c1d02202f9471d6b0664b7a46e81da62d149f688adc7ba2b3413372d26fa618a8460eba01010304010000002206034211ab0f75c3a307a2f6bf6f09a9e05d3c8edd0ba7a2ac31f432d1045ef638191c5c9e228d3000008001000080000000800100008000000000030000002206039690cf74941da5db291fa8be7348abe3807786732d969eac5d27e0afa909a55f1c34652fae300000800100008000000080010000800000000003000000220602ab84641359fa22461b8461515231da63c196614cd22b26e556ed878e30db4da60c094ef78400000000030000000104220020a3c65c4e376d82fb3ca45596feee5b08313ad64f38590c1b08bc530d1c0bbfea010569522102ab84641359fa22461b8461515231da63c196614cd22b26e556ed878e30db4da621034211ab0f75c3a307a2f6bf6f09a9e05d3c8edd0ba7a2ac31f432d1045ef6381921039690cf74941da5db291fa8be7348abe3807786732d969eac5d27e0afa909a55f53ae0000')
+    # changed with with introduction of signature grinding
+    psbt_right = bytes.fromhex('70736274ff0100520200000001bde05be36069e2e0fe44793c68ad8244bb1a52cc37f152e0fa5b75e40169d7f70000000000fdffffff018b1e000000000000160014ed5180f05c7b1dc980732602c50cda40530e00ad4de11c004f01024289ef0000000000000000007dd565da7ee1cf05c516e89a608968fed4a2450633a00c7b922df66b27afd2e1033a0a4fa4b0a997738ac2f142a395c1f02afcb31d7ffd46a90a0c927a4c411fd704094ef7844f01024289ef0431fcbdcc8000000112d4aaea7292e7870c7eeb3565fa1c1fa8f957fa7c4c24b411d5b4f5710d359a023e63d1e54063525bea286ccb2a0ad7b14560aa31ec4be826afa883141dfe1d53145c9e228d300000800100008000000080010000804f01024289ef04e44b38f1800000014a1960f3a3c86ba355a16a66a548cfb62eeb25663311f7cd662a192896f3777e038cc595159a395e4ec35e477c9523a1512f873e74d303fb03fc9a1503b1ba45271434652fae30000080010000800000008001000080000100df02000000000101d1a321707660769c7f8604d04c9ae2db58cf1ec7a01f4f285cdcbb25ce14bdfd0300000000fdffffff02401f00000000000017a914bfd0b8471a3706c1e17870a4d39b0354bcea57b687c864000000000000160014e608b171d63ec24d9fa252d5c1e45624b14e44700247304402205133eb96df167b895f657cce31c6882840a403013682d9d4651aed2730a7dad502202aaacc045d85d9c711af0c84e7f355cc18bf2f8e6d91774d42ba24de8418a39e012103a58d8eb325abb412eaf927cf11d8b7641c4a468ce412057e47892ca2d13ed6144de11c002202034211ab0f75c3a307a2f6bf6f09a9e05d3c8edd0ba7a2ac31f432d1045ef6381947304402201008b084f53d3064ee381dfb3ff4373b29d6ae765b2af15a4e217e8d5d049c650220576af95d79b8fc686627da8a534141208b225ceb6085cd93fcaffb153ac016ea01010304010000002206034211ab0f75c3a307a2f6bf6f09a9e05d3c8edd0ba7a2ac31f432d1045ef638191c5c9e228d3000008001000080000000800100008000000000030000002206039690cf74941da5db291fa8be7348abe3807786732d969eac5d27e0afa909a55f1c34652fae300000800100008000000080010000800000000003000000220602ab84641359fa22461b8461515231da63c196614cd22b26e556ed878e30db4da60c094ef78400000000030000000104220020a3c65c4e376d82fb3ca45596feee5b08313ad64f38590c1b08bc530d1c0bbfea010569522102ab84641359fa22461b8461515231da63c196614cd22b26e556ed878e30db4da621034211ab0f75c3a307a2f6bf6f09a9e05d3c8edd0ba7a2ac31f432d1045ef6381921039690cf74941da5db291fa8be7348abe3807786732d969eac5d27e0afa909a55f53ae0000')
+    seed_words = 'all all all all all all all all all all all all'
+    expect_xfp = swab32(int('5c9e228d', 16))
+    assert xfp2str(expect_xfp) == '5c9e228d'.upper()
+
+    # load specific private key
+    xfp = set_seed_words(seed_words)
+    assert xfp == expect_xfp
+
+    # check Coldcard derives expected Upub
+    derivation = "m/48h/1h/0h/1h"       # part of devtest/unit_iss6743.py
+    expect_xpub = 'Upub5SJWbuhs5tM4mkJST69tnpGGaf8dDTqByx3BLSocWFpq5YLh1fky4DQTFGQVG6nCSqZfUiAAeStdxSQteUcfMsWjDkhniZx4GdwpB18Tnbq'
+
+    pub = sim_execfile('devtest/unit_iss6743.py')
+    assert pub == expect_xpub
+
+    # verify psbt globals section
+    tp = BasicPSBT().parse(psbt_b4)
+    (hdr_xpub, hdr_path), = [(v,k) for v,k in tp.xpubs if k[0:4] == pack('<I', expect_xfp)]
+    assert expect_xpub == encode_base58_checksum(hdr_xpub)
+    assert derivation == path_to_str(unpack('<%dI' % (len(hdr_path) // 4),hdr_path))
+
+    # sign a multisig, with xpubs in globals
+    _, out_psbt = try_sign(psbt_b4, accept=True, accept_ms_import=True)
+    assert out_psbt != psbt_wrong
+    assert out_psbt == psbt_right
+
+    open('debug/i6.psbt', 'wt').write(out_psbt.hex())
 
 @pytest.mark.parametrize('N', [ 3, 15])
 @pytest.mark.parametrize('xderiv', [ None, 'any', 'unknown', '*', '', 'none'])
@@ -2756,7 +2823,7 @@ def test_bitcoind_MofN_tutorial(m_n, desc_type, clear_ms, goto_home, need_keypre
     ("Key derivation too long", "wsh(sortedmulti(2,[0f056943/48'/1'/0'/2']tpubDF2rnouQaaYrXF4noGTv6rQYmx87cQ4GrUdhpvXkhtChwQPbdGTi8GA88NUaSrwZBwNsTkC9bFkkC8vDyGBVVAQTZ2AS6gs68RQXtXcCvkP/0/*,[c463f778/44'/0'/0']tpubDD8pw7eZ9bUzYUR1LK5wpkA69iy3BpuLxPzsE6FFNdtTnJDySduc1VJdFEhEJQDKjYktznKdJgHwaQDRfQDQJpceDxH22c1ZKUMjrarVs7M/0))#s487stua"),
     ("Cannot use hardened sub derivation path", "wsh(sortedmulti(2,[0f056943/48'/1'/0'/2']tpubDF2rnouQaaYrXF4noGTv6rQYmx87cQ4GrUdhpvXkhtChwQPbdGTi8GA88NUaSrwZBwNsTkC9bFkkC8vDyGBVVAQTZ2AS6gs68RQXtXcCvkP/0/*,[c463f778/44'/0'/0']tpubDD8pw7eZ9bUzYUR1LK5wpkA69iy3BpuLxPzsE6FFNdtTnJDySduc1VJdFEhEJQDKjYktznKdJgHwaQDRfQDQJpceDxH22c1ZKUMjrarVs7M/0'/*))#3w6hpha3"),
     # ("Unsupported descriptor", "wsh(multi(1,xpub661MyMwAqRbcFW31YEwpkMuc5THy2PSt5bDMsktWQcFF8syAmRUapSCGu8ED9W6oDMSgv6Zz8idoc4a6mr8BDzTJY47LJhkJ8UB7WEGuduB/1/0/*,xpub69H7F5d8KSRgmmdJg2KhpAK8SR3DjMwAdkxj3ZuxV27CprR9LgpeyGmXUbC6wb7ERfvrnKZjXoUmmDznezpbZb7ap6r1D3tgFxHmwMkQTPH/0/0/*))#t2zpj2eu"),
-    ("Unsupported descriptor", "pkh([d34db33f/44'/0'/0']xpub6ERApfZwUNrhLCkDtcHTcxd75RbzS1ed54G1LkBUHQVHQKqhMkhgbmJbZRkrgZw4koxb5JaHWkY4ALHY2grBGRjaDMzQLcgJvLJuZZvRcEL/1/*)#ml40v0wf"),
+    ("Unsupported descriptor", "pkh([0f056943/48'/1'/0'/2']tpubDF2rnouQaaYrXF4noGTv6rQYmx87cQ4GrUdhpvXkhtChwQPbdGTi8GA88NUaSrwZBwNsTkC9bFkkC8vDyGBVVAQTZ2AS6gs68RQXtXcCvkP/1/*)"),
     ("M must be <= N", "wsh(sortedmulti(3,[0f056943/48'/1'/0'/2']tpubDF2rnouQaaYrXF4noGTv6rQYmx87cQ4GrUdhpvXkhtChwQPbdGTi8GA88NUaSrwZBwNsTkC9bFkkC8vDyGBVVAQTZ2AS6gs68RQXtXcCvkP/0/*,[c463f778/44'/0'/0']tpubDD8pw7eZ9bUzYUR1LK5wpkA69iy3BpuLxPzsE6FFNdtTnJDySduc1VJdFEhEJQDKjYktznKdJgHwaQDRfQDQJpceDxH22c1ZKUMjrarVs7M/0/*))#uueddtsy"),
 ])
 def test_exotic_descriptors(desc, clear_ms, goto_home, need_keypress, pick_menu_item, cap_menu,
@@ -3383,11 +3450,11 @@ def test_import_multisig_usb_json(use_regtest, cs, way, cap_menu, clear_ms,
         {"name": "my_miniscript", "random": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"}
     ),
     (
-        "'name' length",
+        "'name' too long",
         {"name": "a" * 41, "desc": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"}
     ),
     (
-        "'name' length",
+        "'name' too short",
         {"name": "a", "desc": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"}
     ),
     (
@@ -3395,7 +3462,7 @@ def test_import_multisig_usb_json(use_regtest, cs, way, cap_menu, clear_ms,
         {"name": "ab", "desc": "", "random": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"}
     ),
     (
-        "'desc' empty",
+        "'desc' value not a str",
         {"name": "ab", "desc": None, "random": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"}
     ),
 ])

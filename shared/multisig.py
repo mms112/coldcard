@@ -10,7 +10,7 @@ from ux import ux_show_story, ux_confirm, ux_dramatic_pause, ux_clear_keys
 from ux import import_export_prompt, ux_enter_bip32_index, show_qr_code, ux_enter_number, OK, X
 from files import CardSlot, CardMissingError, needs_microsd
 from descriptor import Descriptor
-from miniscript import Key, Sortedmulti, Number
+from miniscript import Key, Multi, Sortedmulti, Number
 from desc_utils import multisig_descriptor_template
 from public_constants import AF_P2SH, AF_P2WSH_P2SH, AF_P2WSH, AFC_SCRIPT, MAX_SIGNERS, AF_P2TR
 from menu import MenuSystem, MenuItem, NonDefaultMenuItem
@@ -236,11 +236,12 @@ class MultisigWallet(BaseStorageWallet):
 
     @classmethod
     def is_correct_chain(cls, o, curr_chain):
-        if "ch" not in o[-1]:
+        options = o[-2] if len(o) == 5 else o[-1]
+        if "ch" not in options:
             # mainnet
             ch = "BTC"
         else:
-            ch = o[-1]["ch"]
+            ch = options["ch"]
 
         if ch == curr_chain.ctype:
             return True
@@ -708,7 +709,7 @@ class MultisigWallet(BaseStorageWallet):
             Key.from_cc_data(xfp, deriv, xpub)
             for xfp, deriv, xpub in self.xpubs
         ]
-        miniscript = Sortedmulti(Number(self.M), *keys)
+        miniscript = Sortedmulti(Number(self.M), *keys) if self.bip67 else Multi(Number(self.M), *keys)
         desc = Descriptor(miniscript=miniscript)
         desc.set_from_addr_fmt(self.addr_fmt)
         return desc

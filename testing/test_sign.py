@@ -2030,11 +2030,13 @@ def _test_single_sig_sighash(cap_story, press_select, start_sign, end_sign, dev,
 
         assert resp["complete"] is True
         tx_hex = resp["hex"]
+        
+        # sign and get finalized tx ready for broadcast out
+        start_sign(psbt_sh_bytes, finalize=True)
+        cc_tx_hex = end_sign(accept=True, finalize=True)
 
-        if tx_check:
-            # sign and get finalized tx ready for broadcast out
-            start_sign(psbt_sh_bytes, finalize=True)
-            cc_tx_hex = end_sign(accept=True, finalize=True)
+        # tx_check would always fail for P2TR, since the signature uses a random nonce
+        if tx_check and addr_fmt != "bech32m":
             assert tx_hex == cc_tx_hex.hex()
 
         if psbt_v2:
@@ -2063,7 +2065,13 @@ def _test_single_sig_sighash(cap_story, press_select, start_sign, end_sign, dev,
         # for PSBTv2 here we check if we correctly finalize
         res = bitcoind.supply_wallet.testmempoolaccept([tx_hex])
         assert res[0]["allowed"]
+        # check that the coldcard correctly finalizes 
+        # additional check is necessary for P2TR, since the PSBT is different
+        res = bitcoind.supply_wallet.testmempoolaccept([cc_tx_hex.hex()])
+        assert res[0]["allowed"]
         txn_id = bitcoind.supply_wallet.sendrawtransaction(tx_hex)
+        assert txn_id
+        txn_id = bitcoind.supply_wallet.sendrawtransaction(cc_tx_hex.hex())
         assert txn_id
 
     return doit

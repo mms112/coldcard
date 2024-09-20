@@ -2265,7 +2265,8 @@ def dev_core_import_object(dev):
     ders = [
         ("m/44h/1h/0h", AF_CLASSIC),
         ("m/49h/1h/0h", AF_P2WPKH_P2SH),
-        ("m/84h/1h/0h", AF_P2WPKH)
+        ("m/84h/1h/0h", AF_P2WPKH),
+        ("m/86h/1h/0h", AF_P2TR)
     ]
     descriptors = []
     for idx, (path, addr_format) in enumerate(ders):
@@ -2300,7 +2301,7 @@ from test_drv_entro import derive_bip85_secret, activate_bip85_ephemeral
 from test_ephemeral import generate_ephemeral_words, import_ephemeral_xprv, goto_eph_seed_menu
 from test_ephemeral import ephemeral_seed_disabled_ui, restore_main_seed, confirm_tmp_seed
 from test_ephemeral import verify_ephemeral_secret_ui, get_identity_story, get_seed_value_ux, seed_vault_enable
-from test_multisig import import_ms_wallet, make_multisig, offer_ms_import, fake_ms_txn
+from test_multisig import import_ms_wallet, import_multisig, make_multisig, offer_ms_import, fake_ms_txn
 from test_multisig import make_ms_address, clear_ms, make_myself_wallet
 from test_miniscript import offer_minsc_import
 from test_se2 import goto_trick_menu, clear_all_tricks, new_trick_pin, se2_gate, new_pin_confirmed

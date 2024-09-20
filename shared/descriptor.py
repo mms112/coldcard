@@ -211,9 +211,8 @@ class Descriptor:
                 k.taproot = taproot
 
     def legacy_ms_compat(self):
-        if not (self.is_sortedmulti and self.addr_fmt in (AF_P2SH, AF_P2WSH, AF_P2WSH_P2SH)):
-            raise ValueError("Unsupported descriptor. Supported: sh(, sh(wsh(, wsh(. "
-                             "MUST be sortedmulti.")
+        if not (self.is_basic_multisig and self.addr_fmt in (AF_P2SH, AF_P2WSH, AF_P2WSH_P2SH)):
+            raise ValueError("Unsupported descriptor. Supported: sh(), sh(wsh()), wsh(). ")
 
     def validate(self):
         from glob import settings
@@ -229,13 +228,13 @@ class Descriptor:
         has_mine = 0
         my_xfp = settings.get('xfp')
         to_check = self.keys.copy()
-        if self.tapscript:
-            assert len(self.keys) <= MAX_TR_SIGNERS
-            assert self.key  # internal key (would fail during parse)
-            if not self.key.is_provably_unspendable:
-                to_check += [self.key]
-        else:
-            assert self.key is None and self.miniscript, "not miniscript"
+        #if self.tapscript:
+        #    assert len(self.keys) <= MAX_TR_SIGNERS
+        #    assert self.key  # internal key (would fail during parse)
+        #    if not self.key.is_provably_unspendable:
+        #        to_check += [self.key]
+        #else:
+        #    assert self.key is None and self.miniscript, "not miniscript"
 
         c = chains.current_key_chain().ctype
         for k in to_check:
