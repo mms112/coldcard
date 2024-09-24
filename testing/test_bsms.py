@@ -211,7 +211,7 @@ def make_coordinator_round2(make_coordinator_round1, settings_get, settings_set,
                 xpub = sk.hwif(as_private=False)
                 keys.append((root_xfp, "m/" + path, xpub))
 
-        desc_obj = MultisigDescriptor(M=M, N=N, addr_fmt=af_map[addr_fmt], keys=keys)
+        desc_obj = MultisigDescriptor(M=M, N=N, addr_fmt=af_map[addr_fmt], keys=keys, is_sorted=sortedmulti)
         desc = desc_obj._serialize(int_ext=True)
         wcs = append_checksum(desc).split("#")[-1]
         desc = desc.replace("/<0;1>/*", "/**")
@@ -220,7 +220,7 @@ def make_coordinator_round2(make_coordinator_round1, settings_get, settings_set,
         elif wrong_checksum:
             desc = desc + "#" + wcs
         if not sortedmulti:
-            desc = desc.replace("sortedmulti", "multi")
+            settings_set("unsort_ms", 1)
         desc_template = "%s\n" % bsms_version
         desc_template += "%s\n" % desc
         desc_template += "%s\n" % path_restrictions
@@ -799,13 +799,15 @@ def test_coordinator_round2(way, encryption_type, M_N, addr_fmt, auto_collect, c
     assert addr == address
 
 
+@pytest.mark.veryslow
+@pytest.mark.parametrize("sortedmulti", [True, False])
 @pytest.mark.parametrize("refuse", [True, False])
 @pytest.mark.parametrize("way", ["sd", "nfc", "vdisk"])
 @pytest.mark.parametrize("encryption_type", ["1", "2", "3"])
 @pytest.mark.parametrize("with_checksum", [True, False])
 @pytest.mark.parametrize("M_N", [(2,2), (3, 5), (15, 15)])
 @pytest.mark.parametrize("addr_fmt", ["p2wsh", "p2sh-p2wsh"])
-def test_signer_round2(refuse, way, encryption_type, M_N, addr_fmt, clear_ms, goto_home, need_keypress, pick_menu_item,
+def test_signer_round2(refuse, way, encryption_type, M_N, addr_fmt, sortedmulti, clear_ms, goto_home, need_keypress, pick_menu_item,
                        cap_menu, cap_story, microsd_path, settings_remove, nfc_read_text, request, settings_get,
                        make_coordinator_round2, nfc_write_text, microsd_wipe, with_checksum,
                        press_select, press_cancel, is_q1):
@@ -816,7 +818,7 @@ def test_signer_round2(refuse, way, encryption_type, M_N, addr_fmt, clear_ms, go
     M, N = M_N
     clear_ms()
     microsd_wipe()
-    desc_template, token = make_coordinator_round2(M, N, addr_fmt, encryption_type, way=way, add_checksum=with_checksum)
+    desc_template, token = make_coordinator_round2(M, N, addr_fmt, encryption_type, way=way, add_checksum=with_checksum, sortedmulti=sortedmulti)
     goto_home()
     pick_menu_item('Settings')
     pick_menu_item('Multisig Wallets')
@@ -879,6 +881,8 @@ def test_signer_round2(refuse, way, encryption_type, M_N, addr_fmt, clear_ms, go
     policy = "Policy: %d of %d" % (M, N)
     assert policy in story
     assert addr_fmt.upper() in story
+    if not sortedmulti:
+        assert "WARNING: BIP-67 disabled" in story
     ms_wal_name = story.split("\n\n")[1].split("\n")[-1].strip()
     ms_wal_menu_item = "%d/%d: %s" % (M, N, ms_wal_name)
     if refuse:
@@ -1111,7 +1115,7 @@ def test_wrong_encryption_coordinator_round2(encryption_type, make_coordinator_r
 
 
 @pytest.mark.parametrize("failure", [
-    "wrong_address", "path_restrictions", "bsms_version", "sortedmulti", "has_ours", "ours_no",
+    "wrong_address", "path_restrictions", "bsms_version", "has_ours", "ours_no",
     "wrong_encryption", "wrong_chain", "wrong_checksum"
 ])
 @pytest.mark.parametrize("encryption_type", ["1", "2", "3"])
@@ -1128,9 +1132,6 @@ def test_failure_signer_round2(encryption_type, goto_home, press_select, pick_me
     elif failure == "bsms_version":
         kws = {failure: "BSMS 2.0"}
         failure_msg = "Incompatible BSMS version. Need BSMS 1.0 got BSMS 2.0"
-    elif failure == "sortedmulti":
-        kws = {failure: False}
-        failure_msg = "Unsupported descriptor. Supported: sh(, sh(wsh(, wsh(. MUST be sortedmulti."
     elif failure == "has_ours":
         kws = {failure: False}
         failure_msg = "My key 0F056943 missing in descriptor."

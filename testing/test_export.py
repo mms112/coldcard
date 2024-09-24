@@ -631,6 +631,7 @@ def test_export_xpub(use_nfc, acct_num, dev, cap_menu, pick_menu_item, goto_home
 
         press_cancel()
 
+@pytest.mark.veryslow
 @pytest.mark.parametrize("chain", ["BTC", "XTN", "XRT"])
 @pytest.mark.parametrize("way", ["sd", "vdisk", "nfc", "qr"])
 @pytest.mark.parametrize("addr_fmt", [AF_P2WPKH, AF_P2WPKH_P2SH, AF_CLASSIC, AF_P2TR])

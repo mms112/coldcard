@@ -228,11 +228,11 @@ class Descriptor:
         has_mine = 0
         my_xfp = settings.get('xfp')
         to_check = self.keys.copy()
-        #if self.tapscript:
-        #    assert len(self.keys) <= MAX_TR_SIGNERS
-        #    assert self.key  # internal key (would fail during parse)
-        #    if not self.key.is_provably_unspendable:
-        #        to_check += [self.key]
+        if self.tapscript:
+            assert len(self.keys) <= MAX_TR_SIGNERS
+            assert self.key  # internal key (would fail during parse)
+            if not self.key.is_provably_unspendable:
+                to_check += [self.key]
         #else:
         #    assert self.key is None and self.miniscript, "not miniscript"
 

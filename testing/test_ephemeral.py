@@ -494,6 +494,7 @@ def test_ephemeral_seed_generate(num_words, generate_ephemeral_words, dice,
         restore_main_seed(preserve_settings)
 
 
+@pytest.mark.veryslow
 @pytest.mark.parametrize("num_words", [12, 18, 24])
 @pytest.mark.parametrize("nfc", [False, True])
 @pytest.mark.parametrize("truncated", [False, True])

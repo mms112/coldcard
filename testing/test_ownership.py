@@ -36,6 +36,7 @@ def test_negative(addr_fmt, testnet, sim_exec):
 
     assert 'Explained' in lst
 
+@pytest.mark.veryslow
 @pytest.mark.parametrize('addr_fmt, chain', [
 	(AF_CLASSIC, "XTN"),
 	(AF_CLASSIC, "BTC"),

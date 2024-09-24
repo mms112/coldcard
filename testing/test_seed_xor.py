@@ -170,6 +170,8 @@ def restore_seed_xor(set_seed_words, goto_home, pick_menu_item, cap_story,
 
     return doit
 
+
+@pytest.mark.veryslow
 @pytest.mark.parametrize('way', ["qr", "seedqr", "classic"])
 @pytest.mark.parametrize('incl_self', [False, True])
 @pytest.mark.parametrize('seed_vault', [False, True])
@@ -198,6 +200,7 @@ def test_import_xor(seed_vault, incl_self, parts, expect, restore_seed_xor, way,
     restore_seed_xor(parts, expect, incl_self, seed_vault, way=way)
 
 
+@pytest.mark.veryslow
 @pytest.mark.parametrize('incl_self', [False, True])
 @pytest.mark.parametrize("parts, expect", [
     ([zero32] * 2, zero32),

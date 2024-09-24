@@ -2077,6 +2077,7 @@ def _test_single_sig_sighash(cap_story, press_select, start_sign, end_sign, dev,
     return doit
 
 
+@pytest.mark.veryslow
 @pytest.mark.bitcoind
 @pytest.mark.parametrize("addr_fmt", ["legacy", "p2sh-segwit", "bech32", "bech32m"])
 @pytest.mark.parametrize("sighash", [sh for sh in SIGHASH_MAP if sh != 'ALL'])
@@ -2089,6 +2090,7 @@ def test_sighash_same(addr_fmt, sighash, num_ins, num_outs, psbt_v2, _test_singl
                              psbt_v2=psbt_v2)
 
 
+@pytest.mark.veryslow
 @pytest.mark.bitcoind
 @pytest.mark.parametrize("addr_fmt", ["legacy", "p2sh-segwit", "bech32", "bech32m"])
 @pytest.mark.parametrize("sighash", list(itertools.combinations(SIGHASH_MAP.keys(), 2)))

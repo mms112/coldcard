@@ -373,6 +373,7 @@ def verify_armored_signature(pick_menu_item, nfc_write_text, press_select,
         return title, story
     return doit
 
+@pytest.mark.veryslow
 @pytest.mark.bitcoind
 @pytest.mark.parametrize("chain", ["XRT", "BTC", "XTN"])
 @pytest.mark.parametrize("way", ("sd", "nfc"))

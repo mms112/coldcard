@@ -1546,6 +1546,7 @@ def test_ms_sign_myself(M, use_regtest, make_myself_wallet, segwit, num_ins, dev
         _, txn, is_complete = b64decode(rv.get('psbt', '')), rv.get('hex'), rv['complete']
         assert is_complete
 
+@pytest.mark.veryslow
 @pytest.mark.parametrize('addr_fmt', ['p2wsh', 'p2sh-p2wsh'])
 @pytest.mark.parametrize('acct_num', [ 0, None, 4321])
 @pytest.mark.parametrize('M_N', [(2,3), (8,14)])
@@ -2321,6 +2322,7 @@ def test_import_desciptor(M_N, addr_fmt, int_ext_desc, way, import_ms_wallet, go
     assert f"{desc}(" in desc_export
 
 
+@pytest.mark.veryslow
 @pytest.mark.bitcoind
 @pytest.mark.parametrize("change", [True, False])
 @pytest.mark.parametrize('desc', ["multi", "sortedmulti"])
@@ -2549,6 +2551,7 @@ def test_legacy_multisig_witness_utxo_in_psbt(bitcoind, use_regtest, clear_ms, m
     try_sign(updated)
 
 
+@pytest.mark.veryslow
 @pytest.mark.bitcoind
 @pytest.mark.parametrize("m_n", [(2,2), (3, 5), (15, 15)])
 @pytest.mark.parametrize("desc_type", ["p2wsh_desc", "p2sh_p2wsh_desc", "p2sh_desc"])

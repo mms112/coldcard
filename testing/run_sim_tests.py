@@ -255,6 +255,11 @@ def main():
     if args.q1:
         DEFAULT_SIMULATOR_ARGS.append('--q1')
 
+    if args.veryslow:
+        pytest_marks_default = "veryslow"
+    else:
+        pytest_marks_default = "not onetime and not veryslow and not manual"
+
     if args.module is None:
         test_modules = []
     elif len(args.module) == 1 and args.module[0].lower() == "all":
@@ -294,7 +299,8 @@ def main():
         if args.q1 and '--q1' not in test_args:
             test_args.append('--q1')
 
-        ec, failed_tests = run_coldcard_tests(test_module, simulator_args=test_args,
+        ec, failed_tests = run_coldcard_tests(test_module, pytest_marks=pytest_marks_default,
+                                              simulator_args=test_args,
                                               pytest_k=args.pytest_k, pdb=args.pdb,
                                               failed_first=args.ff, psbt2=args.psbt2,
                                               headless=args.headless)
@@ -303,7 +309,7 @@ def main():
         print(80 * "=")
 
     # run veryslow is specified
-    if args.veryslow:
+    if args.veryslow and not args.module:
         print("started veryslow tests")
         ec, failed_tests = run_coldcard_tests(test_module=None, pytest_marks="veryslow",
                                               pytest_k=args.pytest_k, pdb=args.pdb,
